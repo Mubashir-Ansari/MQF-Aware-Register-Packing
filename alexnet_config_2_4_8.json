@@ -1,0 +1,76 @@
+{
+  "config": {
+    "conv1.0": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    },
+    "conv2.0": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    },
+    "conv3.0": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    },
+    "conv4.0": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    },
+    "conv5.0": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    },
+    "fc1": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    },
+    "fc2": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    },
+    "fc3": {
+      "weight": 2,
+      "activation": 2,
+      "packing_factor": 2,
+      "granular_dist": {
+        "2": 100.0
+      }
+    }
+  },
+  "metadata": {
+    "target_drop": 3.0,
+    "final_drop": 0.0,
+    "register_size": 16,
+    "num_moves": 8,
+    "avg_packing_factor": 2.0,
+    "total_throughput_gain": 2.0
+  }
+}

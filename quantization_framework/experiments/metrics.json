@@ -1,0 +1,17 @@
+{
+  "model": "swin",
+  "baseline_accuracy": 89.65,
+  "ptq_accuracy": 83.5,
+  "final_accuracy": 85.55,
+  "accuracy_drop": 4.1,
+  "ptq_drop": 6.15,
+  "compression_ratio": 4.6,
+  "compression_percentage": 78.27,
+  "baseline_size_mb": 106.34,
+  "quantized_size_mb": 23.11,
+  "config_file": "swin_auto_config.json",
+  "quantization_method": "QAT",
+  "qat_triggered": true,
+  "qat_threshold": 5.0,
+  "timestamp": "2026-01-28T01:45:44.388856"
+}
