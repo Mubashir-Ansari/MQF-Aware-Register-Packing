@@ -26,6 +26,7 @@ import subprocess
 import json
 import time
 import torch
+import csv
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,6 +46,59 @@ def run_command(cmd):
     ret = os.system(cmd)
     if ret != 0:
         raise RuntimeError(f"Command failed with return code {ret}: {cmd}")
+
+
+def profile_needs_regeneration(profile_csv, current_baseline_acc, baseline_tol=5.0):
+    """
+    Detect stale/corrupt sensitivity profile.
+
+    Regenerate if:
+    1) File missing/empty
+    2) Baseline in CSV differs too much from current measured baseline
+    3) All/near-all sensitivity entries are zero (common bad-profile symptom)
+    """
+    if not os.path.exists(profile_csv):
+        return True, "profile_missing"
+
+    rows = []
+    try:
+        with open(profile_csv, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+    except Exception:
+        return True, "profile_unreadable"
+
+    if not rows:
+        return True, "profile_empty"
+
+    # Check baseline consistency
+    csv_baselines = []
+    sensitivity_vals = []
+    for row in rows:
+        try:
+            csv_baselines.append(float(row.get("baseline_acc", 0.0)))
+        except Exception:
+            pass
+        for k, v in row.items():
+            if k.startswith("sensitivity_"):
+                try:
+                    sensitivity_vals.append(abs(float(v)))
+                except Exception:
+                    pass
+
+    if not csv_baselines:
+        return True, "baseline_missing"
+
+    csv_baseline_avg = sum(csv_baselines) / len(csv_baselines)
+    if abs(csv_baseline_avg - current_baseline_acc) > baseline_tol:
+        return True, f"baseline_mismatch(csv={csv_baseline_avg:.2f}, current={current_baseline_acc:.2f})"
+
+    if sensitivity_vals:
+        max_sens = max(sensitivity_vals)
+        if max_sens < 1e-6:
+            return True, "all_zero_sensitivity"
+
+    return False, "profile_ok"
 
 
 def calculate_bops_joint(model, config, input_size=32):
@@ -280,14 +334,18 @@ def auto_quantize_joint(args):
     # STEP 1: JOINT PROBE (Joint W=A Sensitivity Analysis)
     # ---------------------------------------------------------
     probe_start = time.time()
-    if not os.path.exists(joint_profile_csv):
+    regen, reason = profile_needs_regeneration(joint_profile_csv, acc_baseline)
+    if regen:
         print(f"\n[STEP 1] Generating Joint W=A Sensitivity Profile ({joint_profile_csv})...")
+        if reason != "profile_missing":
+            print(f"[STEP 1] Rebuilding profile due to: {reason}")
         bits_str = " ".join(map(str, bit_choices))
         cmd = f"python quantization_framework/experiments/joint_sensitivity.py " \
               f"--model {model_name} " \
               f"--checkpoint {checkpoint_path} " \
               f"--dataset {dataset} " \
               f"--bits {bits_str} " \
+              f"--device {device} " \
               f"--max-samples {args.max_samples}"
         # Note: joint_sensitivity.py auto-generates output filename
         run_command(cmd)
@@ -377,6 +435,8 @@ def auto_quantize_joint(args):
         hrp_metadata = joint_config_data.get('metadata', {})
         avg_packing_factor = hrp_metadata.get('avg_packing_factor', 1.0)
         total_throughput_gain = hrp_metadata.get('total_throughput_gain', 1.0)
+        weighted_avg_packing_factor = hrp_metadata.get('weighted_avg_packing_factor', None)
+        weighted_throughput_gain = hrp_metadata.get('weighted_throughput_gain', None)
 
     # Verify W=A constraint by comparing weight and activation configs
     matching = 0
@@ -416,17 +476,21 @@ def auto_quantize_joint(args):
             param_counts[name] = module.weight.numel()
 
     print("\n[ALGO REPORT: REGISTER-MISMATCH ANALYSIS]")
-    print(f"{'Layer':12} | {'2b %':7} | {'4b %':7} | {'8b %':7} | {'Pack (A)':8} | {'Status'}")
-    print("-" * 80)
+    print(f"{'Layer':12} | {'2b %':7} | {'4b %':7} | {'8b %':7} | {'Pack (A)':8} | {'Ew':5} | {'Status'}")
+    print("-" * 92)
     
     # Fair comparison: Baseline (8-bit) should also be subjected to HRP constraints
     from quantization.hardware_sim import RegisterPackingSimulator
+    from quantization.packing import ReQAPPackingPlanner
     reg_size = hrp_metadata.get('register_size', 16)
     sim = RegisterPackingSimulator(reg_size)
+    planner = ReQAPPackingPlanner(register_size=reg_size, max_d=8)
     d_base = sim.find_max_packing_factor(8, 8) # Baseline is 8-bit Weight/Activation
     
     total_baseline_registers = 0
     total_mqf_registers = 0
+    total_baseline_storage_words = 0
+    total_mqf_storage_words = 0
     
     for layer, c in joint_config_data['config'].items():
         dist = c.get('granular_dist', {})
@@ -449,8 +513,16 @@ def auto_quantize_joint(args):
 
         pack_a = c.get('packing_factor', 1.0)
         status = "GRANULAR" if isinstance(w_bit, list) or len(dist) > 1 else "UNIFORM"
-        
-        print(f"{layer:12} | {p2:>6}% | {p4:>6}% | {p8:>6}% | {pack_a:<8.2f} | {status}")
+
+        if isinstance(w_bit, list) and len(w_bit) > 0:
+            eff_w_bits = int(round(sum(w_bit) / len(w_bit)))
+        elif dist:
+            eff_w_bits = int(round(sum(int(k) * (v / 100.0) for k, v in dist.items() if str(k).isdigit())))
+        else:
+            eff_w_bits = int(w_bit) if isinstance(w_bit, int) else 8
+        plan = planner.plan(eff_w_bits, eff_w_bits)
+
+        print(f"{layer:12} | {p2:>6}% | {p4:>6}% | {p8:>6}% | {pack_a:<8.2f} | {plan.empty_bits_weight:<5d} | {status}")
         
         params = param_counts.get(layer, 0)
         
@@ -480,7 +552,26 @@ def auto_quantize_joint(args):
         total_baseline_registers += base_regs
         total_mqf_registers += mqf_regs
 
-    print("-" * 80)
+        # Raw storage packing perspective (without accumulation safety bound):
+        # number of R-bit words needed for weights.
+        # Baseline is fixed 8-bit weights.
+        total_baseline_storage_words += (params * 8.0) / reg_size
+        if isinstance(w_bit, list) and len(w_bit) > 0:
+            total_mqf_storage_words += (sum(w_bit) / reg_size) * (params / len(w_bit))
+        elif dist:
+            weighted_bits = 0.0
+            for bits_s, pct in dist.items():
+                try:
+                    bits_i = int(bits_s)
+                except ValueError:
+                    continue
+                weighted_bits += bits_i * (pct / 100.0)
+            total_mqf_storage_words += (params * weighted_bits) / reg_size
+        else:
+            bits_scalar = w_bit if isinstance(w_bit, int) else 8
+            total_mqf_storage_words += (params * bits_scalar) / reg_size
+
+    print("-" * 92)
     print(f"  Register Count (8-bit Baseline - HRP-Aware): {int(total_baseline_registers):,}")
     print(f"  MQF registers count:                         {int(total_mqf_registers):,}")
     
@@ -488,6 +579,16 @@ def auto_quantize_joint(args):
     # For user report, we want to show SAVINGS
     savings = (1.0 - (total_mqf_registers / total_baseline_registers)) * 100 if total_baseline_registers > 0 else 0
     print(f"  Estimated Register Savings:                  {savings:.2f}%")
+    storage_savings = (1.0 - (total_mqf_storage_words / total_baseline_storage_words)) * 100 if total_baseline_storage_words > 0 else 0
+    print(f"  Storage Words (R={reg_size}b, baseline 8b): {int(total_baseline_storage_words):,}")
+    print(f"  MQF storage words (packed by bit-width):     {int(total_mqf_storage_words):,}")
+    print(f"  Estimated Storage Savings:                   {storage_savings:.2f}%")
+    base_plan = planner.plan(8, 8, d=d_base)
+    print(f"  Packed ops supported:                        {', '.join(base_plan.ops_supported)}")
+    if weighted_avg_packing_factor is not None:
+        print(f"  Weighted Avg Packing (param-weighted):       {weighted_avg_packing_factor:.2f}")
+    if weighted_throughput_gain is not None:
+        print(f"  Weighted Throughput Gain:                    {weighted_throughput_gain:.2f}x")
     print(f"  Quantization Mode:                           JOINT W=A")
     print("-" * 70)
 

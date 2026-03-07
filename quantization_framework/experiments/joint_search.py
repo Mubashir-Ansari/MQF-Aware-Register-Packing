@@ -309,6 +309,14 @@ def hrp_greedy_search(
     baseline_avg_packing = baseline_d if baseline_d > 0 else 1.0
     final_config['metadata']['avg_packing_factor'] = round(avg_packing, 2)
     final_config['metadata']['total_throughput_gain'] = round(avg_packing / baseline_avg_packing, 2)
+
+    # Parameter-weighted packing metrics (more representative than layer-average)
+    if param_counts:
+        total_params = sum(param_counts.get(layer, 0) for layer in config.keys())
+        if total_params > 0:
+            weighted_packing = sum(param_counts.get(layer, 0) * config[layer]['d'] for layer in config.keys()) / total_params
+            final_config['metadata']['weighted_avg_packing_factor'] = round(weighted_packing, 2)
+            final_config['metadata']['weighted_throughput_gain'] = round(weighted_packing / baseline_avg_packing, 2)
     
     # Calculate bit distribution
     bit_distribution = {}

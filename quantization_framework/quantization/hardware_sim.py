@@ -1,5 +1,9 @@
 import torch
 import math
+try:
+    from quantization.packing import ReQAPPackingPlanner
+except ModuleNotFoundError:
+    from .packing import ReQAPPackingPlanner
 
 class RegisterPackingSimulator:
     """
@@ -14,23 +18,11 @@ class RegisterPackingSimulator:
     """
     def __init__(self, register_size=16):
         self.R = register_size
+        self._planner = ReQAPPackingPlanner(register_size=register_size, max_d=8)
 
     def is_valid_packing(self, w_bits, a_bits, d):
         """Check if (W, A, d) triplet fits in the register without overflow."""
-        if d <= 0: return False
-        
-        # Segment size per packed element
-        segment_size = self.R // d
-        
-        # Max value representable in the segment (unsigned for simplicity in formula)
-        max_accum_segment = 2 ** segment_size
-        
-        # Formula implementation: d * (2^W - 1) * (2^A - 1)
-        # We use (2^W - 1) for unsigned or 2^(W-1)-1 for signed. 
-        # The user's formula d*(2^x-1)*(2^y-1) suggests unsigned range logic.
-        required_range = d * (2**w_bits - 1) * (2**a_bits - 1)
-        
-        return required_range < max_accum_segment
+        return self._planner.is_safe(w_bits, a_bits, d)
 
     def find_max_packing_factor(self, w_bits, a_bits, max_d=8):
         """
@@ -39,11 +31,8 @@ class RegisterPackingSimulator:
         By default we cap d at 8 (practical SIMD lane cap), but we now
         evaluate all integer values in [1, max_d] instead of only powers of two.
         """
-        upper = min(max_d, self.R)  # d cannot exceed register width in bits
-        for d in range(upper, 0, -1):  # Try highest first
-            if self.is_valid_packing(w_bits, a_bits, d):
-                return d
-        return 1  # Fallback to 1
+        self._planner.max_d = int(max_d)
+        return self._planner.best_factor(w_bits, a_bits)
 
     def get_carrying_budget(self, w_bits, a_bits, d):
         """

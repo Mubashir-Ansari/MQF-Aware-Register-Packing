@@ -1,4 +1,8 @@
 import torch
+try:
+    from quantization.packing import ReQAPPackingPlanner
+except ModuleNotFoundError:
+    from .packing import ReQAPPackingPlanner
 
 # Global context for MQF Register-Aware Execution
 # Tracks scaling factors and carrying space across layers for hardware simulation
@@ -14,9 +18,6 @@ def get_carrying_budget(packing_factor, w_bits, a_bits, register_size=16):
     Calculates the carrying budget (remaining bits in the register 
     after segments are assigned) available for accumulation.
     """
-    segment_size = register_size // packing_factor
-    payload_bits = w_bits + a_bits
-    
-    # Simple segment-based carry budget
-    # The segment must hold (2^W - 1) * (2^A - 1) * (some_accumulation_factor)
-    return segment_size - payload_bits
+    planner = ReQAPPackingPlanner(register_size=register_size, max_d=max(1, packing_factor))
+    plan = planner.plan(w_bits, a_bits, d=packing_factor)
+    return plan.lane_headroom_bits

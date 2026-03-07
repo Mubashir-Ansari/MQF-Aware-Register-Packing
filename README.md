@@ -180,3 +180,23 @@ Unlike naive calculations (params / 2), the **HRP Register Count** enforces hard
 - LeViT and Swin use reduced batch sizes automatically to fit within GPU memory constraints.
 - GTSRB and CIFAR inputs are upsampled to 224×224 for transformer-based models; VGG processes at native 32×32.
 - QAT uses a cosine-annealed learning rate with early stopping. The best validation checkpoint is saved as `<model>_qat_best.pth`.
+
+---
+
+## Packing Algorithm Module
+
+The repository now includes a REQAP-style packing planner at:
+`quantization_framework/quantization/packing.py`
+
+It provides:
+- Feasible packing factors `d` under Eq.1
+- Best packing plan selection (`d`, lane bits, empty-bit budget)
+- Supported packed operations reporting (`pack`, `unpack`, `packed_mul`, `packed_mac`)
+- Packed dot-product simulation for throughput estimation
+
+Quick demo:
+
+```bash
+python quantization_framework/experiments/packing_algorithm_demo.py \
+  --register-size 16 --w-bits 2 --a-bits 2 --max-d 8
+```
