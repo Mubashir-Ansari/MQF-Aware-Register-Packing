@@ -94,13 +94,27 @@ def verify_wa_constraint(config_path):
             bit_distribution[pair] = bit_distribution.get(pair, 0) + 1
 
         print("Bit-width distribution (W=A pairs):")
-        for pair in sorted(bit_distribution.keys(), key=lambda x: int(x[1]), reverse=True):
+        # Define a safe sort key that handles lists/non-ints
+        def safe_sort_key(pair_str):
+            try:
+                # Try to extract first number if it's W8/A8 format
+                import re
+                match = re.search(r'W(\d+)', pair_str)
+                if match: return -int(match.group(1))
+                return 0
+            except:
+                return 0
+
+        for pair in sorted(bit_distribution.keys(), key=safe_sort_key):
             count = bit_distribution[pair]
             pct = (count / len(matches)) * 100
             print(f"  {pair}: {count:3d} layers ({pct:5.1f}%)")
 
         # Calculate average
-        avg_bits = sum(w for _, w, _ in matches) / len(matches)
+        def get_val(v):
+            return sum(v)/len(v) if isinstance(v, list) else v
+            
+        avg_bits = sum(get_val(w) for _, w, _ in matches) / len(matches)
         print(f"\nAverage bits per layer: {avg_bits:.2f}")
 
         print(f"\n✅ COMPLIANCE: 100% ({len(matches)}/{len(config)} layers)")

@@ -62,6 +62,7 @@ def calculate_bops_joint(model, config, input_size=32):
         BOPs in GigaBOPs (GBOPs)
     """
     import torch.nn as nn
+    import numpy as np
 
     total_bops = 0
 
@@ -76,17 +77,26 @@ def calculate_bops_joint(model, config, input_size=32):
                 w_bits = config[name]
                 a_bits = config[name]
 
+            # Convert lists to average for BOPs calculation if granular
+            def get_avg_bits(b):
+                return sum(b)/len(b) if isinstance(b, list) else b
+            
+            wb = get_avg_bits(w_bits)
+            ab = get_avg_bits(a_bits)
+
             if isinstance(module, nn.Conv2d):
+                macs = module.in_channels * module.out_channels * \
+                       module.kernel_size[0] * module.kernel_size[1]
+                # Adjust for spatial output (this is an approximation if input_size is global)
                 stride = module.stride[0] if hasattr(module.stride, '__getitem__') else module.stride
+                # Simple spatial estimation
                 h_out = input_size // stride
                 w_out = h_out
-                macs = h_out * w_out * module.in_channels * module.out_channels * \
-                       module.kernel_size[0] * module.kernel_size[1]
-                total_bops += macs * w_bits * a_bits
+                total_bops += (macs * h_out * w_out) * wb * ab
 
             elif isinstance(module, nn.Linear):
                 macs = module.in_features * module.out_features
-                total_bops += macs * w_bits * a_bits
+                total_bops += macs * wb * ab
 
     return total_bops / 1e9  # GBOPs
 
@@ -387,6 +397,11 @@ def auto_quantize_joint(args):
     print(f"{'Layer':12} | {'2b %':7} | {'4b %':7} | {'8b %':7} | {'Pack (A)':8} | {'Status'}")
     print("-" * 80)
     
+    # Fair comparison: Baseline (8-bit) should also be subjected to HRP constraints
+    from quantization.hardware_sim import RegisterPackingSimulator
+    sim = RegisterPackingSimulator(reg_size)
+    d_base = sim.find_max_packing_factor(8, 8) # Baseline is 8-bit Weight/Activation
+    
     total_baseline_registers = 0
     total_mqf_registers = 0
     
@@ -396,7 +411,6 @@ def auto_quantize_joint(args):
         p4 = dist.get('4', 0.0)
         p8 = dist.get('8', 0.0)
         
-        # If the keys are 100.0 but bit-choices are different
         if not dist:
             w_bit = c.get('weight', 8)
             p2 = 100.0 if w_bit == 2 else 0.0
@@ -406,25 +420,26 @@ def auto_quantize_joint(args):
         pack_a = c.get('packing_factor', 1.0)
         status = "GRANULAR" if len(dist) > 1 else "UNIFORM"
         
-        print(f"{layer:12} | {p2:>6}% | {p4:>6}% | {p8:>6}% | {pack_a:<8} | {status}")
+        print(f"{layer:12} | {p2:>6}% | {p4:>6}% | {p8:>6}% | {pack_a:<8.2f} | {status}")
         
-        # Register Count calculation (Baseline: 8-bit in 16-bit register = 2 Params/Reg)
         params = param_counts.get(layer, 0)
-        reg_size = joint_config_data['metadata'].get('register_size', 16)
         
-        base_regs = params / (reg_size / 8)
+        # d_base is the FAIR packing for 8-bit baseline on the same hardware
+        base_regs = params / d_base
         mqf_regs = params / pack_a if pack_a > 0 else base_regs
         
         total_baseline_registers += base_regs
         total_mqf_registers += mqf_regs
 
     print("-" * 80)
-    print(f"  Register Count Original (Total):        {int(total_baseline_registers):,}")
-    print(f"  MQF registers count:                    {int(total_mqf_registers):,}")
+    print(f"  Register Count (8-bit Baseline - HRP-Aware): {int(total_baseline_registers):,}")
+    print(f"  MQF registers count:                         {int(total_mqf_registers):,}")
     
     storage_efficiency = (total_baseline_registers / total_mqf_registers * 100) if total_mqf_registers > 0 else 0
-    print(f"  Storage Efficiency (Stage A):           {storage_efficiency:.2f}%")
-    print(f"  Quantization Mode:                      JOINT W=A")
+    # For user report, we want to show SAVINGS
+    savings = (1.0 - (total_mqf_registers / total_baseline_registers)) * 100 if total_baseline_registers > 0 else 0
+    print(f"  Estimated Register Savings:                  {savings:.2f}%")
+    print(f"  Quantization Mode:                           JOINT W=A")
     print("-" * 70)
 
     # Remove redundant device detection later down
@@ -563,8 +578,11 @@ def auto_quantize_joint(args):
     quantized_bops = calculate_bops_joint(model, joint_config_for_bops, input_size)
     bops_reduction = baseline_bops / quantized_bops if quantized_bops > 0 else 1.0
 
-    # Calculate average bits
-    bits_list = [weight_config[layer] for layer in weight_config.keys()]
+    # Calculate average bits (handling granular bit-lists)
+    def get_avg_val(v):
+        return sum(v)/len(v) if isinstance(v, list) else v
+    
+    bits_list = [get_avg_val(weight_config[layer]) for layer in weight_config.keys()]
     avg_bits = sum(bits_list) / len(bits_list) if bits_list else 8.0
 
     print(f"\n{'='*70}")
