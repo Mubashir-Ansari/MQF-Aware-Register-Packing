@@ -411,15 +411,22 @@ def auto_quantize_joint(args):
         p2 = dist.get('2', 0.0)
         p4 = dist.get('4', 0.0)
         p8 = dist.get('8', 0.0)
-        
+
+        w_bit = c.get('weight', 8)
         if not dist:
-            w_bit = c.get('weight', 8)
-            p2 = 100.0 if w_bit == 2 else 0.0
-            p4 = 100.0 if w_bit == 4 else 0.0
-            p8 = 100.0 if w_bit == 8 else 0.0
+            if isinstance(w_bit, list):
+                total = len(w_bit)
+                if total > 0:
+                    p2 = 100.0 * sum(1 for b in w_bit if b == 2) / total
+                    p4 = 100.0 * sum(1 for b in w_bit if b == 4) / total
+                    p8 = 100.0 * sum(1 for b in w_bit if b == 8) / total
+            else:
+                p2 = 100.0 if w_bit == 2 else 0.0
+                p4 = 100.0 if w_bit == 4 else 0.0
+                p8 = 100.0 if w_bit == 8 else 0.0
 
         pack_a = c.get('packing_factor', 1.0)
-        status = "GRANULAR" if len(dist) > 1 else "UNIFORM"
+        status = "GRANULAR" if isinstance(w_bit, list) or len(dist) > 1 else "UNIFORM"
         
         print(f"{layer:12} | {p2:>6}% | {p4:>6}% | {p8:>6}% | {pack_a:<8.2f} | {status}")
         
@@ -427,7 +434,26 @@ def auto_quantize_joint(args):
         
         # d_base is the FAIR packing for 8-bit baseline on the same hardware
         base_regs = params / d_base
-        mqf_regs = params / pack_a if pack_a > 0 else base_regs
+
+        # Exact granular accounting: regs = sum(params_frac / d_frac)
+        if isinstance(w_bit, list) and len(w_bit) > 0:
+            from collections import Counter
+            bit_counts = Counter(w_bit)
+            mqf_regs = 0.0
+            for bits, cnt in bit_counts.items():
+                d_sub = sim.find_max_packing_factor(int(bits), int(bits))
+                mqf_regs += cnt / max(d_sub, 1)
+        elif dist:
+            mqf_regs = 0.0
+            for bits_s, pct in dist.items():
+                try:
+                    bits_i = int(bits_s)
+                except ValueError:
+                    continue
+                d_sub = sim.find_max_packing_factor(bits_i, bits_i)
+                mqf_regs += (params * (pct / 100.0)) / max(d_sub, 1)
+        else:
+            mqf_regs = params / pack_a if pack_a > 0 else base_regs
         
         total_baseline_registers += base_regs
         total_mqf_registers += mqf_regs

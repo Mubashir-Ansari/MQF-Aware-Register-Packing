@@ -58,7 +58,8 @@ def insert_activation_quantizers(model, act_bit_width=8, quantize_activations=Tr
     model_device = next(model.parameters()).device
     
     # Track per-layer bit-widths for logging
-    bit_dist = {}
+    layer_bit_dist = {}
+    channel_bit_dist = {}
     
     for name, module in layers_to_wrap:
         # Determine bit-width for this layer
@@ -78,12 +79,19 @@ def insert_activation_quantizers(model, act_bit_width=8, quantize_activations=Tr
         quantizer.to(model_device)  # Move to model's device
         quantizers.append(quantizer)
         
-        # Track distribution (handle list)
+        # Track distribution
         if isinstance(bits, list):
+            # Layer-level dominant representation for readable percentages
+            from collections import Counter
+            counts = Counter(bits)
+            dominant_bit = counts.most_common(1)[0][0] if counts else act_bit_width
+            layer_bit_dist[dominant_bit] = layer_bit_dist.get(dominant_bit, 0) + 1
+
+            # Channel-level view (optional, does not sum to number of layers)
             for b in bits:
-                bit_dist[b] = bit_dist.get(b, 0) + 1
+                channel_bit_dist[b] = channel_bit_dist.get(b, 0) + 1
         else:
-            bit_dist[bits] = bit_dist.get(bits, 0) + 1
+            layer_bit_dist[bits] = layer_bit_dist.get(bits, 0) + 1
         
         # Create closure to capture quantizer instance
         def make_hook(q):
@@ -96,10 +104,17 @@ def insert_activation_quantizers(model, act_bit_width=8, quantize_activations=Tr
     # Log summary
     if activation_config:
         print(f"[ACTIVATION QUANT] Inserted {len(quantizers)} mixed-precision quantizers:")
-        for bits in sorted(bit_dist.keys(), reverse=True):
-            count = bit_dist[bits]
+        for bits in sorted(layer_bit_dist.keys(), reverse=True):
+            count = layer_bit_dist[bits]
             pct = (count / len(quantizers)) * 100
             print(f"  A{bits}: {count:3d} layers ({pct:5.1f}%)")
+        if channel_bit_dist:
+            total_channels = sum(channel_bit_dist.values())
+            print("  Channel-level distribution:")
+            for bits in sorted(channel_bit_dist.keys(), reverse=True):
+                count = channel_bit_dist[bits]
+                pct = (count / total_channels) * 100 if total_channels > 0 else 0.0
+                print(f"    A{bits}: {count:4d} channels ({pct:5.1f}%)")
     else:
         print(f"[ACTIVATION QUANT] Inserted quantizers on {len(quantizers)} layers (bit_width={act_bit_width})")
     

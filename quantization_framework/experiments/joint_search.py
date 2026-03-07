@@ -68,6 +68,14 @@ def get_filter_counts(model):
             counts[name] = module.weight.shape[0]
     return counts
 
+def get_layer_param_counts(model):
+    """Get total parameter counts for each quantizable layer."""
+    counts = {}
+    for name, module in model.named_modules():
+        if hasattr(module, 'weight') and module.weight is not None:
+            counts[name] = module.weight.numel()
+    return counts
+
 def calculate_granular_packing(weights_shape, bit_widths, register_size=16):
     """
     Simulates granular packing savings for a weight tensor.
@@ -96,7 +104,15 @@ def calculate_granular_packing(weights_shape, bit_widths, register_size=16):
     return avg_d, total_savings_fp32
 
 
-def hrp_greedy_search(sensitivity, bit_choices, target_drop=3.0, baseline_acc=None, register_size=16, filter_counts=None):
+def hrp_greedy_search(
+    sensitivity,
+    bit_choices,
+    target_drop=3.0,
+    baseline_acc=None,
+    register_size=16,
+    filter_counts=None,
+    param_counts=None
+):
     """
     Heterogeneous Register Packing (HRP) Greedy Search.
     Optimizes for MAC Throughput (d) while staying under target accuracy drop.
@@ -124,8 +140,8 @@ def hrp_greedy_search(sensitivity, bit_choices, target_drop=3.0, baseline_acc=No
         config[layer] = {'w_bits': max_bits, 'a_bits': max_bits, 'd': d}
 
     # Tracking search state
-    estimated_drop = 0.0
-    total_d_gain = sum(c['d'] for c in config.values())
+    baseline_d = sim.find_max_packing_factor(max_bits, max_bits)
+    baseline_total_d = len(config) * baseline_d
     
     # Pre-calculate all possible valid moves for each layer
     all_possible_moves = []
@@ -140,17 +156,22 @@ def hrp_greedy_search(sensitivity, bit_choices, target_drop=3.0, baseline_acc=No
                 drop = scores[bits]
                 new_d = sim.find_max_packing_factor(bits, bits)
                 d_gain = new_d - current_d
-                
-                if d_gain >= 0: # Either same throughput or better
-                    # Score = Throughput Gain / (Accuracy Drop + small constant)
-                    # If gain is 0, we still want to move to lower bits if drop is small
-                    score = (d_gain + 0.1) / (drop + 0.01)
+                layer_params = (param_counts or {}).get(layer, 1)
+                # Register reduction proxy: params * (1/d_old - 1/d_new)
+                reg_gain = layer_params * ((1.0 / max(current_d, 1e-9)) - (1.0 / max(new_d, 1e-9)))
+
+                # Keep strict hardware-aware objective:
+                # if packing factor and register reduction do not improve, do not spend accuracy budget.
+                if d_gain > 0 and reg_gain > 0:
+                    score = reg_gain / (drop + 0.01)
                     all_possible_moves.append({
                         'layer': layer,
                         'w_bits': bits,
                         'a_bits': bits,
+                        'old_bits': current_w,
                         'd': new_d,
                         'd_gain': d_gain,
+                        'reg_gain': reg_gain,
                         'drop': drop,
                         'score': score
                     })
@@ -192,6 +213,24 @@ def hrp_greedy_search(sensitivity, bit_choices, target_drop=3.0, baseline_acc=No
             if remaining_budget > 0 and best_move['drop'] > remaining_budget:
                 # Linearly interpolate to find the partition fraction
                 fraction = remaining_budget / best_move['drop']
+
+                # Conservative cap to reduce accuracy cliffs in critical/early layers.
+                layer_name_lower = layer.lower()
+                if "conv1" in layer_name_lower:
+                    max_fraction = 0.20
+                elif "conv" in layer_name_lower:
+                    max_fraction = 0.30
+                elif "fc" in layer_name_lower:
+                    max_fraction = 0.50
+                else:
+                    max_fraction = 0.35
+
+                if best_move.get('old_bits') == 8 and best_move['w_bits'] == 2:
+                    fraction = min(fraction, max_fraction)
+
+                if fraction <= 0:
+                    continue
+
                 best_move['is_granular'] = True
                 best_move['fraction'] = fraction
                 # Calculate bit distribution percentages
@@ -203,7 +242,7 @@ def hrp_greedy_search(sensitivity, bit_choices, target_drop=3.0, baseline_acc=No
                     str(new_bits): round(fraction * 100, 1),
                     str(old_bits): round((1 - fraction) * 100, 1)
                 }
-                best_move['drop'] = remaining_budget
+                best_move['drop'] = best_move['drop'] * fraction
                 # Adjust packing factor average
                 old_d = config[layer]['d']
                 new_d = best_move['d']
@@ -266,8 +305,10 @@ def hrp_greedy_search(sensitivity, bit_choices, target_drop=3.0, baseline_acc=No
         }
         total_d += c['d']
     
-    final_config['metadata']['avg_packing_factor'] = round(total_d / len(config), 2)
-    final_config['metadata']['total_throughput_gain'] = round(total_d / len(config), 2) # Simplified for POC
+    avg_packing = total_d / len(config)
+    baseline_avg_packing = baseline_d if baseline_d > 0 else 1.0
+    final_config['metadata']['avg_packing_factor'] = round(avg_packing, 2)
+    final_config['metadata']['total_throughput_gain'] = round(avg_packing / baseline_avg_packing, 2)
     
     # Calculate bit distribution
     bit_distribution = {}
@@ -279,16 +320,16 @@ def hrp_greedy_search(sensitivity, bit_choices, target_drop=3.0, baseline_acc=No
 
     stats = {
         'total_layers': len(config),
-        'estimated_drop': round(estimated_drop, 2),
-        'total_throughput_gain': sum(c['d'] for c in config.values()),
-        'baseline_throughput': len(config), # All d=1
+        'estimated_drop': round(current_drop, 2),
+        'total_throughput_gain': (sum(c['d'] for c in config.values()) / baseline_total_d) if baseline_total_d > 0 else 1.0,
+        'baseline_throughput': baseline_total_d,
         'avg_packing_factor': sum(c['d'] for c in config.values()) / len(config),
         'moves_made': len(moves_made),
         'bit_distribution': bit_distribution,
         'average_bits': round(avg_bits, 2),
         'baseline_accuracy': baseline_acc,
         'target_drop': target_drop,
-        'estimated_accuracy': round(baseline_acc - estimated_drop, 2)
+        'estimated_accuracy': round(baseline_acc - current_drop, 2)
     }
 
     print(f"\n{'='*70}")
@@ -461,6 +502,7 @@ Examples:
     
     model = load_model(args.model, checkpoint_path=args.checkpoint, num_classes=num_classes)
     filter_counts = get_filter_counts(model)
+    param_counts = get_layer_param_counts(model)
     print(f"✓ Found {len(filter_counts)} quantizable layers")
 
     # Run HRP search
@@ -470,7 +512,8 @@ Examples:
         target_drop=args.target_drop,
         baseline_acc=args.baseline_acc,
         register_size=args.register_size,
-        filter_counts=filter_counts
+        filter_counts=filter_counts,
+        param_counts=param_counts
     )
 
     # Save configuration

@@ -32,12 +32,18 @@ class RegisterPackingSimulator:
         
         return required_range < max_accum_segment
 
-    def find_max_packing_factor(self, w_bits, a_bits):
-        """Find highest d in {1, 2, 4, 8} that satisfies the constraint."""
-        for d in [8, 4, 2, 1]:  # Try highest first
+    def find_max_packing_factor(self, w_bits, a_bits, max_d=8):
+        """
+        Find highest valid packing factor d under Eq.1.
+
+        By default we cap d at 8 (practical SIMD lane cap), but we now
+        evaluate all integer values in [1, max_d] instead of only powers of two.
+        """
+        upper = min(max_d, self.R)  # d cannot exceed register width in bits
+        for d in range(upper, 0, -1):  # Try highest first
             if self.is_valid_packing(w_bits, a_bits, d):
                 return d
-        return 1 # Fallback to 1
+        return 1  # Fallback to 1
 
     def get_carrying_budget(self, w_bits, a_bits, d):
         """
