@@ -13,6 +13,21 @@ import argparse
 import json
 import sys
 
+def summarize_bits(bits):
+    """Compact representation for scalar or granular bit settings."""
+    if isinstance(bits, list):
+        if not bits:
+            return "[]"
+        from collections import Counter
+        counts = Counter(bits)
+        total = len(bits)
+        parts = []
+        for b in sorted(counts.keys(), reverse=True):
+            pct = 100.0 * counts[b] / total
+            parts.append(f"{b}:{pct:.1f}%")
+        return "[" + ", ".join(parts) + "]"
+    return str(bits)
+
 
 def verify_wa_constraint(config_path):
     """
@@ -90,7 +105,7 @@ def verify_wa_constraint(config_path):
         # Show bit distribution
         bit_distribution = {}
         for _, w, a in matches:
-            pair = f"W{w}/A{a}"
+            pair = f"W{summarize_bits(w)}/A{summarize_bits(a)}"
             bit_distribution[pair] = bit_distribution.get(pair, 0) + 1
 
         print("Bit-width distribution (W=A pairs):")

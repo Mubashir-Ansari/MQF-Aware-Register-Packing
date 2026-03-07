@@ -204,6 +204,9 @@ def auto_quantize_joint(args):
     gtsrb_val_ratio = getattr(args, 'gtsrb_val_ratio', 0.2)
     gtsrb_seed = getattr(args, 'gtsrb_seed', 42)
     device = args.device if args.device else ('cuda' if torch.cuda.is_available() else 'cpu')
+    eval_batch_size = getattr(args, 'batch_size', 128)
+    if model_name == 'alexnet' and eval_batch_size > 32:
+        eval_batch_size = 32
     """
     Auto-Quantize Engine with Joint W=A Co-optimization.
 
@@ -261,7 +264,7 @@ def auto_quantize_joint(args):
     else:
         input_size = 224
         
-    loader = get_fashionmnist_dataloader(batch_size=128, train=False, input_size=input_size)
+    loader = get_fashionmnist_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
     # Use already imported evaluate_accuracy
     acc_baseline = evaluate_accuracy(model, loader, device=device, max_samples=args.max_samples)
     print(f"Baseline Accuracy ({model_name} on {dataset}): {acc_baseline:.2f}%")
@@ -339,8 +342,27 @@ def auto_quantize_joint(args):
           f"--config {weight_config_json} " \
           f"--activation-config {activation_config_json} " \
           f"--dataset {dataset} " \
-          f"--device {device}"
-    run_command(cmd)
+          f"--device {device} " \
+          f"--batch-size {eval_batch_size} " \
+          f"--max-samples {args.max_samples}"
+    try:
+        run_command(cmd)
+    except RuntimeError as e:
+        # On crowded GPUs, fallback to CPU validation instead of aborting the full pipeline.
+        if device == 'cuda':
+            print("[WARNING] CUDA validation failed (likely OOM). Retrying validation on CPU...")
+            cmd_cpu = f"python quantization_framework/experiments/validate_config.py " \
+                      f"--model {model_name} " \
+                      f"--checkpoint {checkpoint_path} " \
+                      f"--config {weight_config_json} " \
+                      f"--activation-config {activation_config_json} " \
+                      f"--dataset {dataset} " \
+                      f"--device cpu " \
+                      f"--batch-size 16 " \
+                      f"--max-samples {args.max_samples}"
+            run_command(cmd_cpu)
+        else:
+            raise e
 
     # Check Accuracy Internally
     print("[ENGINE] Internal validation check...")
@@ -487,9 +509,10 @@ def auto_quantize_joint(args):
 
     # Load dataloader
     if dataset == 'cifar100':
-        loader = get_cifar100_dataloader(batch_size=128, train=False, input_size=input_size)
+        loader = get_cifar100_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
     elif dataset == 'gtsrb':
         loader = get_gtsrb_dataloader(
+            batch_size=eval_batch_size,
             train=False,
             input_size=input_size,
             use_train_val_split=gtsrb_use_train_val,
@@ -497,9 +520,9 @@ def auto_quantize_joint(args):
             seed=gtsrb_seed
         )
     elif dataset == 'fashionmnist':
-        loader = get_fashionmnist_dataloader(batch_size=128, train=False, input_size=input_size)
+        loader = get_fashionmnist_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
     else:  # cifar10
-        loader = get_cifar10_dataloader(batch_size=128, train=False, input_size=input_size)
+        loader = get_cifar10_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
 
     # Quick Baseline
     acc_baseline = evaluate_accuracy(model, loader, device=device, max_samples=args.max_samples)
@@ -679,6 +702,8 @@ if __name__ == "__main__":
                         help='Output file for comprehensive metrics')
     parser.add_argument('--max-samples', type=int, default=1000,
                         help='Max samples for evaluation/profiling (default: 1000)')
+    parser.add_argument('--batch-size', type=int, default=128,
+                        help='Evaluation batch size (default: 128; AlexNet auto-capped to 32)')
 
     # GTSRB-specific options
     parser.add_argument('--gtsrb-use-train-val', type=bool, default=False,
