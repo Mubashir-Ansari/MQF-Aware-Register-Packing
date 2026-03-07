@@ -399,6 +399,7 @@ def auto_quantize_joint(args):
     
     # Fair comparison: Baseline (8-bit) should also be subjected to HRP constraints
     from quantization.hardware_sim import RegisterPackingSimulator
+    reg_size = hrp_metadata.get('register_size', 16)
     sim = RegisterPackingSimulator(reg_size)
     d_base = sim.find_max_packing_factor(8, 8) # Baseline is 8-bit Weight/Activation
     
