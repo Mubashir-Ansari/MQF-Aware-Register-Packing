@@ -231,6 +231,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--device', type=str, default=None)
     parser.add_argument('--input-size', type=int, default=None)
+    parser.add_argument('--max-samples', type=int, default=None, help='Max samples for evaluation (default: None, full set)')
     
     args = parser.parse_args()
 
@@ -341,7 +342,7 @@ if __name__ == "__main__":
     # 6. Evaluate
     print("Measuring accuracy of Mixed-Precision Model...")
     eval_start = time.time()
-    acc = evaluate_accuracy(model, loader, device=args.device)
+    acc = evaluate_accuracy(model, loader, device=args.device, max_samples=args.max_samples)
     eval_time = time.time() - eval_start
     print(f"Final Mixed-Precision Accuracy: {acc:.2f}%")
 

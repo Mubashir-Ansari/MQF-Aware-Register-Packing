@@ -70,27 +70,30 @@ python quantization_framework/experiments/auto_quantize_engine_joint.py \
   --checkpoint models/road_0.9994904891304348.pth \
   --dataset gtsrb --bits 2 4 8
 
-# VGG-11 (BN) on CIFAR-10
+# AlexNet on FashionMNIST (HRP Granular POC)
 python quantization_framework/experiments/auto_quantize_engine_joint.py \
-  --model vgg11_bn \
-  --checkpoint models/vgg11_bn.pt \
-  --dataset cifar10 --bits 2 4 8
+  --model alexnet \
+  --checkpoint models/qalex-0-7.pth \
+  --dataset fashionmnist --bits 2 4 8 --register-size 16
 ```
 
 ### Arguments
 
 | Argument | Description | Default |
 |---|---|---|
-| `--model` | Model: `levit`, `resnet`, `swin`, `vgg11_bn` | required |
+| `--model` | Model: `levit`, `resnet`, `swin`, `vgg11_bn`, `alexnet` | required |
 | `--checkpoint` | Path to pre-trained `.pth` / `.pt` checkpoint | required |
-| `--dataset` | Dataset: `cifar10`, `cifar100`, `gtsrb` | required |
+| `--dataset` | Dataset: `cifar10`, `cifar100`, `gtsrb`, `fashionmnist` | required |
 | `--bits` | Candidate bit-widths (space-separated) | required |
+| `--register-size`| Hardware register size in bits | `16` |
+| `--max-samples` | Max samples for validation/profiling | `1000` |
 | `--target-drop` | Max allowed accuracy drop (%) for the search | `3.0` |
 | `--qat-threshold` | Accuracy drop (%) above which QAT is triggered | `5.0` |
 
 ### Datasets
 
 - **CIFAR-10 / CIFAR-100**: downloaded automatically to `./data/` on first run.
+- **FashionMNIST**: downloaded automatically to `./data/` on first run. Used for AlexNet POC.
 - **GTSRB**: download manually from [Kaggle](https://www.kaggle.com/datasets/meowmeowmeowmeowmeow/gtsrb-german-traffic-sign) and place under `./data/gtsrb/` with `Train/`, `Test/` subdirectories and `Test.csv`.
 
 ### Checkpoints
@@ -113,6 +116,8 @@ The engine runs the following steps automatically:
 
 **Step 5 — QAT recovery** (only if PTQ fails): fine-tunes the quantized model for up to 15 epochs with early stopping (patience = 5). Best validation checkpoint is saved.
 
+**Step 3.1 — Register-Mismatch Analysis**: generates a hardware-aware report comparing the HRP registers vs a safe 8-bit baseline on the specified register size.
+
 **Step 6 — BOPs calculation**: reports Bit Operations for both FP32 baseline and the quantized model.
 
 ### Outputs
@@ -133,6 +138,7 @@ All runs use bits `{2, 4, 8}` with a 3% target accuracy drop.
 
 | Model | Dataset | Params | Baseline | Final Acc | Avg Bits | BOPs Reduction | Outcome |
 |---|---|---|---|---|---|---|---|
+| AlexNet | FashionMNIST | 58.3M | 81.94% | 83.20% | 7.30 | **12.1x** | PTQ passed |
 | VGG-11-BN | CIFAR-10 | 28.1M | 92.77% | 91.11% | 5.45 | **48.78×** | PTQ passed |
 | ResNet-18 | GTSRB | 11.2M | 99.51% | 95.34% | 5.71 | **32.28×** | QAT (best val) |
 | LeViT | CIFAR-10 | 37.6M | 97.82% | 97.17% | 7.05 | **16.01×** | QAT (best val) |
@@ -142,12 +148,29 @@ All runs use bits `{2, 4, 8}` with a 3% target accuracy drop.
 
 | Model | W8/A8 | W4/A4 | W2/A2 |
 |---|---|---|---|
+| AlexNet | 93.1% | 0.0% | 6.9% |
 | VGG-11-BN | 36.4% (4/11) | 63.6% (7/11) | — |
 | ResNet-18 | 47.6% (10/21) | 42.9% (9/21) | 9.5% (2/21) |
 | LeViT | 77.8% (49/63) | 19.0% (12/63) | 3.2% (2/63) |
 | Swin-T | 90.6% (48/53) | 9.4% (5/53) | — |
 
 W=A constraint compliance: **100%** across all models and layers.
+
+---
+
+## Glossary & Definitions
+
+### Bit Operations (BOPs)
+BOPs measure the total number of bit-level calculations in the model.
+- **Formula**: `MACs * Weight_bits * Activation_bits`
+- **GBOPs**: Giga Bit Operations ($10^9$ BOPs).
+- **BOPs Reduction**: Comparison between a 32-bit (FP32) baseline and your mixed-precision model.
+
+### Register Count (HRP-Aware)
+Unlike naive calculations (params / 2), the **HRP Register Count** enforces hardware safety:
+- **Safety Formula**: `d * (2^W - 1) * (2^A - 1) < 2^(RegisterSize / d)`
+- **Why 8-bit/4-bit don't always pack?** In a 16-bit register, an 8-bit product (max 65,025 for unsigned) takes 16 bits. There is NO room to pack two such operations safely without overflow.
+- **How to save registers?** Drop layers to **2-bit** or increase **register-size to 32-bit**.
 
 ---
 

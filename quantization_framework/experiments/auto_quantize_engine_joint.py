@@ -263,7 +263,7 @@ def auto_quantize_joint(args):
         
     loader = get_fashionmnist_dataloader(batch_size=128, train=False, input_size=input_size)
     # Use already imported evaluate_accuracy
-    acc_baseline = evaluate_accuracy(model, loader, device=device, max_samples=500)
+    acc_baseline = evaluate_accuracy(model, loader, device=device, max_samples=args.max_samples)
     print(f"Baseline Accuracy ({model_name} on {dataset}): {acc_baseline:.2f}%")
 
     # Paths (include bit-widths to avoid confusion between different runs)
@@ -285,7 +285,7 @@ def auto_quantize_joint(args):
               f"--checkpoint {checkpoint_path} " \
               f"--dataset {dataset} " \
               f"--bits {bits_str} " \
-              f"--max-samples 500"
+              f"--max-samples {args.max_samples}"
         # Note: joint_sensitivity.py auto-generates output filename
         run_command(cmd)
     else:
@@ -476,7 +476,7 @@ def auto_quantize_joint(args):
         loader = get_cifar10_dataloader(batch_size=128, train=False, input_size=input_size)
 
     # Quick Baseline
-    acc_baseline = evaluate_accuracy(model, loader, device=device, max_samples=1000)
+    acc_baseline = evaluate_accuracy(model, loader, device=device, max_samples=args.max_samples)
 
     # Apply Config
     from experiments.validate_config import apply_mixed_precision, calibrate_activation_quantizers
@@ -492,7 +492,7 @@ def auto_quantize_joint(args):
     if quantizers:
         calibrate_activation_quantizers(model, quantizers, loader, device=device, num_batches=10)
 
-    acc_ptq = evaluate_accuracy(model, loader, device=device, max_samples=1000)
+    acc_ptq = evaluate_accuracy(model, loader, device=device, max_samples=args.max_samples)
     drop = acc_baseline - acc_ptq
     validation_time = time.time() - validation_start
     print(f"\n[GATE RESULT] Baseline: {acc_baseline:.2f}% | PTQ: {acc_ptq:.2f}% | Drop: {drop:.2f}%")
@@ -523,7 +523,8 @@ def auto_quantize_joint(args):
               f"--activation-config {activation_config_json} " \
               f"--dataset {dataset} " \
               f"--epochs 15 " \
-              f"--patience 5"
+              f"--patience 5 " \
+              f"--max-samples {args.max_samples}"
         run_command(cmd)
 
         print("\n[SUCCESS] QAT Completed. Measuring final accuracy...")
@@ -545,7 +546,7 @@ def auto_quantize_joint(args):
             if quantizers_qat:
                 calibrate_activation_quantizers(model_qat, quantizers_qat, loader, device=device, num_batches=10)
 
-            final_acc = evaluate_accuracy(model_qat, loader, device=device, max_samples=None)
+            final_acc = evaluate_accuracy(model_qat, loader, device=device, max_samples=args.max_samples)
             print(f"[QAT RESULT] Final Accuracy: {final_acc:.2f}%")
             model = model_qat
         else:
@@ -650,6 +651,8 @@ if __name__ == "__main__":
                         help='Accuracy drop threshold to trigger QAT (default: 5.0%%)')
     parser.add_argument('--output-metrics', type=str, default='metrics.json',
                         help='Output file for comprehensive metrics')
+    parser.add_argument('--max-samples', type=int, default=1000,
+                        help='Max samples for evaluation/profiling (default: 1000)')
 
     # GTSRB-specific options
     parser.add_argument('--gtsrb-use-train-val', type=bool, default=False,

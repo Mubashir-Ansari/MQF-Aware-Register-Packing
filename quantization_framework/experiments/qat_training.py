@@ -128,7 +128,7 @@ class QATWrapper(nn.Module):
 # ============================================================================
 
 def train_qat(model, config, train_loader, val_loader, 
-              epochs=5, lr=1e-4, patience=3, device='cuda', best_model_path='qat_best_checkpoint.pth'):
+              epochs=5, lr=1e-4, patience=3, device='cuda', best_model_path='qat_best_checkpoint.pth', max_samples=None):
     """
     Fine-tune model with Quantization-Aware Training.
     
@@ -141,6 +141,8 @@ def train_qat(model, config, train_loader, val_loader,
         lr: Learning rate
         patience: Epochs to wait for improvement before early stopping
         device: Device to use
+        best_model_path: Path to save the best model
+        max_samples: Max samples for evaluation
     
     Returns:
         Fine-tuned model
@@ -194,7 +196,7 @@ def train_qat(model, config, train_loader, val_loader,
         
         # Validation - CRITICAL: Use QAT model, not full-precision model!
         model.eval()
-        val_acc = evaluate_accuracy(qat_model, val_loader, device=device)
+        val_acc = evaluate_accuracy(qat_model, val_loader, device=device, max_samples=max_samples)
         model.train()
         epoch_time = time.time() - epoch_start
         epoch_times.append(epoch_time)
@@ -253,6 +255,7 @@ if __name__ == "__main__":
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--input-size', type=int, default=None)
     parser.add_argument('--output', type=str, default='qat_model.pth')
+    parser.add_argument('--max-samples', type=int, default=None, help='Max samples for evaluation')
     
     args = parser.parse_args()
 
@@ -313,7 +316,7 @@ if __name__ == "__main__":
     best_path = f"{args.model}_qat_best.pth"
     model = train_qat(model, config, train_loader, val_loader, 
                       epochs=args.epochs, lr=args.lr, patience=args.patience, device=args.device,
-                      best_model_path=best_path)
+                      best_model_path=best_path, max_samples=args.max_samples)
     
     # Save final model
     torch.save(model.state_dict(), args.output)
