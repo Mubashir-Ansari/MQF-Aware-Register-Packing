@@ -20,40 +20,26 @@ def check_model():
         print(f"Error: {ckpt_path} not found")
         return
 
-    print(f"--- OFFICIAL LOADING TEST ---")
-    # This uses the updated loader with 'quanto' support
+    print(f"--- OFFICIAL VM LOADING TEST ---")
+    # This uses the updated loader with 'quanto' support and weights_only=False
     model = load_model('alexnet', checkpoint_path=ckpt_path)
     model.eval()
 
-    # Normalization Hunt
-    norm_schemes = [
-        ("No Norm (0..1)", None),
-        ("Standard (0.5, 0.5)", (0.5, 0.5)),
-        ("FashionMNIST (0.2860, 0.3530)", (0.2860, 0.3530)),
-        ("MNIST-style (0.1307, 0.3081)", (0.1307, 0.3081))
-    ]
-
-    from evaluation.pipeline import get_fashionmnist_dataloader, evaluate_accuracy
-    from torchvision import transforms, datasets
-
-    for name, stats in norm_schemes:
-        print(f"\nTesting: {name}")
-        
-        # Override transforms manually to be sure
-        t_list = [transforms.Resize((227, 227)), transforms.ToTensor()]
-        if stats:
-            t_list.append(transforms.Normalize((stats[0],), (stats[1],)))
-        transform = transforms.Compose(t_list)
-        
-        dataset = datasets.FashionMNIST(root='./data', train=False, download=True, transform=transform)
-        loader = torch.utils.data.DataLoader(dataset, batch_size=128, shuffle=False)
-        
-        acc = evaluate_accuracy(model, loader, device='cpu', max_samples=2000)
-        print(f"  Accuracy: {acc:.2f}%")
-
+    from evaluation.pipeline import evaluate_accuracy, get_fashionmnist_dataloader
+    
+    # Standard FashionMNIST stats
+    print("\nEvaluating with Standard FashionMNIST Normalization...")
+    dataloader = get_fashionmnist_dataloader(batch_size=128, train=False, input_size=227)
+    
+    # Evaluate full 10,000 samples for solid proof
+    acc = evaluate_accuracy(model, dataloader, device='cpu', max_samples=10000)
+    print(f"\n============================================================")
+    print(f"VERIFIED BASELINE ACCURACY: {acc:.2f}%")
+    print(f"============================================================")
+    
     # Check weight types
     first_weight = next(model.parameters())
-    print(f"\nFirst weight dtype: {first_weight.dtype}")
+    print(f"First weight dtype: {first_weight.dtype}")
 
 if __name__ == "__main__":
     check_model()

@@ -90,7 +90,7 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
                 from . import alexnet as alex_mod
                 sys.modules['__main__'].fasion_mnist_alexnet = alex_mod.AlexNet
             
-            state_dict = torch.load(ckpt_to_load, map_location='cpu')
+            state_dict = torch.load(ckpt_to_load, map_location='cpu', weights_only=False)
             
             # Case 1: Full model or object with state_dict
             if hasattr(state_dict, 'state_dict') and not isinstance(state_dict, dict):
