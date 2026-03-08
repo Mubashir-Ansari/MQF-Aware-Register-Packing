@@ -38,6 +38,7 @@ import sys
 fasion_mnist_alexnet = models.alexnet.AlexNet
 sys.modules['__main__'].fasion_mnist_alexnet = models.alexnet.AlexNet
 from models.model_loaders import load_model
+from analysis.register_packing_optimizer import run_packing_analysis
 
 
 def run_command(cmd):
@@ -832,6 +833,50 @@ def auto_quantize_joint(args):
                  bops_reduction=bops_reduction,
                  wa_compliance=wa_compliance, avg_bits=avg_bits)
 
+    # ============================================================
+    # OPTIONAL STEP 7: POST-MQF REGISTER PACKING ANALYSIS
+    # ============================================================
+    if getattr(args, "run_packing_analysis", False):
+        print(f"\n[STEP 7] Running post-MQF register packing analysis...")
+        packing_output_dir = getattr(args, "packing_output_dir", "packing_reports")
+        aligned_policy = {}
+        aligned_policy_str = getattr(args, "aligned_policy", "2:2,3:4,4:4,8:8")
+        for pair in aligned_policy_str.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            k, v = pair.split(":")
+            aligned_policy[int(k)] = int(v)
+
+        try:
+            reports = run_packing_analysis(
+                model=model,
+                model_name=model_name,
+                dataset=dataset,
+                weight_config=weight_config,
+                activation_config=activation_config,
+                output_dir=packing_output_dir,
+                register_size=getattr(args, "register_size", 16),
+                acc_width=getattr(args, "acc_width", 32),
+                aligned_policy=aligned_policy,
+                alpha=getattr(args, "cost_alpha", 1.0),
+                beta=getattr(args, "cost_beta", 1.0),
+                gamma=getattr(args, "cost_gamma", 1.0),
+                delta=getattr(args, "cost_delta", 1.0),
+                default_input_bits=getattr(args, "default_input_bits", 8),
+                device=device,
+            )
+            print("[PACKING] Completed. Strategy summary:")
+            for sname in ["raw_homogeneous", "aligned", "heterogeneous_storage", "hybrid_storage_compute"]:
+                r = reports[sname]
+                print(
+                    f"  {sname:24s} | regs={r.total_registers:,} | "
+                    f"savings={r.savings_percent:.2f}% | issue_red={r.total_reduction_factor:.3f}x"
+                )
+            print(f"[PACKING] Reports saved to: {packing_output_dir}")
+        except Exception as e:
+            print(f"[PACKING] WARNING: analysis failed: {e}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Auto-Quantization Engine (Joint W=A)')
@@ -870,6 +915,24 @@ if __name__ == "__main__":
                         help='Hardware register size in bits (default: 16)')
     parser.add_argument('--device', type=str, default=None,
                         help='Device to use (e.g., "cuda", "cpu"). Auto-detects if None.')
+    parser.add_argument('--run-packing-analysis', action='store_true',
+                        help='Run post-MQF register packing strategy analysis.')
+    parser.add_argument('--packing-output-dir', type=str, default='packing_reports',
+                        help='Output directory for packing analysis reports.')
+    parser.add_argument('--acc-width', type=int, default=32,
+                        help='Accumulator width for packing analysis (default: 32).')
+    parser.add_argument('--aligned-policy', type=str, default='2:2,3:4,4:4,8:8',
+                        help='Aligned slot policy map, e.g. 2:2,3:4,4:4,8:8.')
+    parser.add_argument('--cost-alpha', type=float, default=1.0,
+                        help='Cost weight alpha for weight registers.')
+    parser.add_argument('--cost-beta', type=float, default=1.0,
+                        help='Cost weight beta for activation registers.')
+    parser.add_argument('--cost-gamma', type=float, default=1.0,
+                        help='Cost weight gamma for output registers.')
+    parser.add_argument('--cost-delta', type=float, default=1.0,
+                        help='Cost weight delta for packed issue count.')
+    parser.add_argument('--default-input-bits', type=int, default=8,
+                        help='Default input activation bits for first layer in packing analysis.')
 
     args = parser.parse_args()
 
