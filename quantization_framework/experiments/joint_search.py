@@ -111,7 +111,9 @@ def hrp_greedy_search(
     baseline_acc=None,
     register_size=16,
     filter_counts=None,
-    param_counts=None
+    param_counts=None,
+    max_layer_budget_share=0.35,
+    min_layers_to_modify=3
 ):
     """
     Heterogeneous Register Packing (HRP) Greedy Search.
@@ -132,6 +134,8 @@ def hrp_greedy_search(
     print("="*70)
     print(f"Register Size: {register_size}-bit")
     print(f"Target Drop: {target_drop}%")
+    print(f"Max Layer Budget Share: {max_layer_budget_share:.2f}")
+    print(f"Min Layers To Modify: {min_layers_to_modify}")
     
     # Initialize all layers to max bits and optimal d
     config = {}
@@ -187,6 +191,8 @@ def hrp_greedy_search(
     current_drop = 0.0
     layer_pool = list(all_possible_moves) # All possible moves
     
+    per_layer_drop_cap = max_layer_budget_share * target_drop
+
     while layer_pool and current_drop < target_drop:
         # Find the best move from the remaining pool
         # This assumes layer_pool is already sorted by score, but we need to re-evaluate
@@ -205,52 +211,48 @@ def hrp_greedy_search(
         layer = best_move['layer']
         
         # BUDGET CHECK for move
-        if (current_drop + best_move['drop']) > target_drop:
-            # OPTIONAL: Try GRANULAR split for this specific move
-            # We can move a FRACTION of the filters to the lower bit-width
-            # to exactly hit the target drop.
-            remaining_budget = target_drop - current_drop
-            if remaining_budget > 0 and best_move['drop'] > remaining_budget:
-                # Linearly interpolate to find the partition fraction
-                fraction = remaining_budget / best_move['drop']
+        remaining_budget = target_drop - current_drop
+        allowed_drop = min(remaining_budget, per_layer_drop_cap)
+        if allowed_drop <= 0:
+            break
 
-                # Conservative cap to reduce accuracy cliffs in critical/early layers.
-                layer_name_lower = layer.lower()
-                if "conv1" in layer_name_lower:
-                    max_fraction = 0.20
-                elif "conv" in layer_name_lower:
-                    max_fraction = 0.30
-                elif "fc" in layer_name_lower:
-                    max_fraction = 0.50
-                else:
-                    max_fraction = 0.35
+        if best_move['drop'] > allowed_drop:
+            # Use granular split to satisfy both global budget and per-layer budget cap.
+            fraction = allowed_drop / best_move['drop']
 
-                if best_move.get('old_bits') == 8 and best_move['w_bits'] == 2:
-                    fraction = min(fraction, max_fraction)
-
-                if fraction <= 0:
-                    continue
-
-                best_move['is_granular'] = True
-                best_move['fraction'] = fraction
-                # Calculate bit distribution percentages
-                # We assume splitting between old_bits and move['w_bits']
-                old_bits = config[layer]['w_bits']
-                new_bits = best_move['w_bits']
-                
-                best_move['granular_weights'] = {
-                    str(new_bits): round(fraction * 100, 1),
-                    str(old_bits): round((1 - fraction) * 100, 1)
-                }
-                best_move['drop'] = best_move['drop'] * fraction
-                # Adjust packing factor average
-                old_d = config[layer]['d']
-                new_d = best_move['d']
-                best_move['d'] = (fraction * new_d) + ((1-fraction) * old_d)
+            # Conservative cap to reduce accuracy cliffs in critical/early layers.
+            layer_name_lower = layer.lower()
+            if "conv1" in layer_name_lower:
+                max_fraction = 0.20
+            elif "conv" in layer_name_lower:
+                max_fraction = 0.30
+            elif "fc" in layer_name_lower:
+                max_fraction = 0.50
             else:
-                # Skip if even splitting doesn't help or budget is gone
-                # layer_pool.remove(best_move) # Already removed
+                max_fraction = 0.35
+
+            if best_move.get('old_bits') == 8 and best_move['w_bits'] == 2:
+                fraction = min(fraction, max_fraction)
+
+            if fraction <= 0:
                 continue
+
+            best_move['is_granular'] = True
+            best_move['fraction'] = fraction
+            # Calculate bit distribution percentages
+            # We assume splitting between old_bits and move['w_bits']
+            old_bits = config[layer]['w_bits']
+            new_bits = best_move['w_bits']
+            
+            best_move['granular_weights'] = {
+                str(new_bits): round(fraction * 100, 1),
+                str(old_bits): round((1 - fraction) * 100, 1)
+            }
+            best_move['drop'] = best_move['drop'] * fraction
+            # Adjust packing factor average
+            old_d = config[layer]['d']
+            new_d = best_move['d']
+            best_move['d'] = (fraction * new_d) + ((1-fraction) * old_d)
 
         # Apply move
         move = best_move
@@ -344,6 +346,8 @@ def hrp_greedy_search(
     print("HRP SEARCH COMPLETE")
     print(f"Total Throughput Gain: {stats['total_throughput_gain']}x (Avg d: {stats['avg_packing_factor']:.2f})")
     print(f"Estimated Accuracy Drop: {stats['estimated_drop']:.2f}%")
+    if len(moves_made) < min_layers_to_modify:
+        print(f"[WARN] Modified only {len(moves_made)} layers (< min_layers_to_modify={min_layers_to_modify}).")
     print("="*70)
 
     return final_config, stats
@@ -459,12 +463,16 @@ Examples:
     # Optional arguments
     parser.add_argument('--output', type=str, default=None,
                        help='Output config JSON path (default: {model}_config_{bits}.json)')
-    parser.add_argument('--bits', type=int, nargs='+', default=[2, 4, 6, 8],
-                       help='Available bit-widths (default: 2 4 6 8)')
+    parser.add_argument('--bits', type=int, nargs='+', default=[2, 3, 4, 8],
+                       help='Available bit-widths (default: 2 3 4 8)')
     parser.add_argument('--target-drop', type=float, default=3.0,
                        help='Target accuracy drop %% (default: 3.0)')
     parser.add_argument('--baseline-acc', type=float, default=None,
                        help='Baseline accuracy (auto-detected if not provided)')
+    parser.add_argument('--max-layer-budget-share', type=float, default=0.35,
+                       help='Max fraction of target drop consumed by one layer (default: 0.35)')
+    parser.add_argument('--min-layers-to-modify', type=int, default=3,
+                       help='Minimum desired number of modified layers (default: 3)')
     parser.add_argument('--device', type=str, default='cpu',
                        help='Device to use (default: cpu)')
 
@@ -521,7 +529,9 @@ Examples:
         baseline_acc=args.baseline_acc,
         register_size=args.register_size,
         filter_counts=filter_counts,
-        param_counts=param_counts
+        param_counts=param_counts,
+        max_layer_budget_share=args.max_layer_budget_share,
+        min_layers_to_modify=args.min_layers_to_modify
     )
 
     # Save configuration

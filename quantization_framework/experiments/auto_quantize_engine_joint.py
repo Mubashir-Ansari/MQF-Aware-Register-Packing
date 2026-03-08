@@ -48,7 +48,7 @@ def run_command(cmd):
         raise RuntimeError(f"Command failed with return code {ret}: {cmd}")
 
 
-def profile_needs_regeneration(profile_csv, current_baseline_acc, baseline_tol=5.0):
+def profile_needs_regeneration(profile_csv, current_baseline_acc, required_samples=None, baseline_tol=5.0):
     """
     Detect stale/corrupt sensitivity profile.
 
@@ -59,6 +59,19 @@ def profile_needs_regeneration(profile_csv, current_baseline_acc, baseline_tol=5
     """
     if not os.path.exists(profile_csv):
         return True, "profile_missing"
+
+    if required_samples is not None:
+        meta_path = f"{profile_csv}.meta.json"
+        if not os.path.exists(meta_path):
+            return True, "profile_meta_missing"
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            prof_samples = int(meta.get("max_samples", 0))
+            if prof_samples < int(required_samples):
+                return True, f"profile_samples_too_low({prof_samples}<{required_samples})"
+        except Exception:
+            return True, "profile_meta_invalid"
 
     rows = []
     try:
@@ -99,6 +112,18 @@ def profile_needs_regeneration(profile_csv, current_baseline_acc, baseline_tol=5
             return True, "all_zero_sensitivity"
 
     return False, "profile_ok"
+
+
+def write_profile_metadata(profile_csv, max_samples, baseline_acc, bits):
+    meta_path = f"{profile_csv}.meta.json"
+    payload = {
+        "max_samples": int(max_samples),
+        "baseline_acc": float(baseline_acc),
+        "bits": list(sorted(set(int(b) for b in bits))),
+        "generated_by": "auto_quantize_engine_joint"
+    }
+    with open(meta_path, "w") as f:
+        json.dump(payload, f, indent=2)
 
 
 def calculate_bops_joint(model, config, input_size=32):
@@ -334,7 +359,12 @@ def auto_quantize_joint(args):
     # STEP 1: JOINT PROBE (Joint W=A Sensitivity Analysis)
     # ---------------------------------------------------------
     probe_start = time.time()
-    regen, reason = profile_needs_regeneration(joint_profile_csv, acc_baseline)
+    profile_samples = max(int(getattr(args, 'profile_samples', 10000)), int(args.max_samples))
+    regen, reason = profile_needs_regeneration(
+        joint_profile_csv,
+        acc_baseline,
+        required_samples=profile_samples
+    )
     if regen:
         print(f"\n[STEP 1] Generating Joint W=A Sensitivity Profile ({joint_profile_csv})...")
         if reason != "profile_missing":
@@ -346,9 +376,10 @@ def auto_quantize_joint(args):
               f"--dataset {dataset} " \
               f"--bits {bits_str} " \
               f"--device {device} " \
-              f"--max-samples {args.max_samples}"
+              f"--max-samples {profile_samples}"
         # Note: joint_sensitivity.py auto-generates output filename
         run_command(cmd)
+        write_profile_metadata(joint_profile_csv, profile_samples, acc_baseline, bit_choices)
     else:
         print(f"\n[STEP 1] Found existing joint profile: {joint_profile_csv}")
     probe_time = time.time() - probe_start
@@ -367,6 +398,8 @@ def auto_quantize_joint(args):
           f"--dataset {dataset} " \
           f"--bits {bits_str} " \
           f"--target-drop {target_drop} " \
+          f"--max-layer-budget-share {getattr(args, 'max_layer_budget_share', 0.35)} " \
+          f"--min-layers-to-modify {getattr(args, 'min_layers_to_modify', 3)} " \
           f"--register-size {getattr(args, 'register_size', 16)} " \
           f"--device {device} " \
           f"--baseline-acc {acc_baseline}"
@@ -476,8 +509,10 @@ def auto_quantize_joint(args):
             param_counts[name] = module.weight.numel()
 
     print("\n[ALGO REPORT: REGISTER-MISMATCH ANALYSIS]")
-    print(f"{'Layer':12} | {'2b %':7} | {'4b %':7} | {'8b %':7} | {'Pack (A)':8} | {'Ew':5} | {'Status'}")
-    print("-" * 92)
+    report_bits = sorted(set(int(b) for b in bit_choices))
+    bit_headers = " | ".join([f"{b}b %".rjust(7) for b in report_bits])
+    print(f"{'Layer':12} | {bit_headers} | {'Pack (A)':8} | {'Ew':5} | {'Status'}")
+    print("-" * (44 + 11 * len(report_bits)))
     
     # Fair comparison: Baseline (8-bit) should also be subjected to HRP constraints
     from quantization.hardware_sim import RegisterPackingSimulator
@@ -494,22 +529,27 @@ def auto_quantize_joint(args):
     
     for layer, c in joint_config_data['config'].items():
         dist = c.get('granular_dist', {})
-        p2 = dist.get('2', 0.0)
-        p4 = dist.get('4', 0.0)
-        p8 = dist.get('8', 0.0)
+        bit_percentages = {int(b): 0.0 for b in report_bits}
 
         w_bit = c.get('weight', 8)
         if not dist:
             if isinstance(w_bit, list):
                 total = len(w_bit)
                 if total > 0:
-                    p2 = 100.0 * sum(1 for b in w_bit if b == 2) / total
-                    p4 = 100.0 * sum(1 for b in w_bit if b == 4) / total
-                    p8 = 100.0 * sum(1 for b in w_bit if b == 8) / total
+                    for b in report_bits:
+                        bit_percentages[b] = 100.0 * sum(1 for x in w_bit if int(x) == b) / total
             else:
-                p2 = 100.0 if w_bit == 2 else 0.0
-                p4 = 100.0 if w_bit == 4 else 0.0
-                p8 = 100.0 if w_bit == 8 else 0.0
+                bw = int(w_bit) if isinstance(w_bit, int) else 8
+                if bw in bit_percentages:
+                    bit_percentages[bw] = 100.0
+        else:
+            for bits_s, pct in dist.items():
+                try:
+                    bits_i = int(bits_s)
+                except ValueError:
+                    continue
+                if bits_i in bit_percentages:
+                    bit_percentages[bits_i] = float(pct)
 
         pack_a = c.get('packing_factor', 1.0)
         status = "GRANULAR" if isinstance(w_bit, list) or len(dist) > 1 else "UNIFORM"
@@ -522,7 +562,8 @@ def auto_quantize_joint(args):
             eff_w_bits = int(w_bit) if isinstance(w_bit, int) else 8
         plan = planner.plan(eff_w_bits, eff_w_bits)
 
-        print(f"{layer:12} | {p2:>6}% | {p4:>6}% | {p8:>6}% | {pack_a:<8.2f} | {plan.empty_bits_weight:<5d} | {status}")
+        bit_cols = " | ".join([f"{bit_percentages[b]:>6.1f}%" for b in report_bits])
+        print(f"{layer:12} | {bit_cols} | {pack_a:<8.2f} | {plan.empty_bits_weight:<5d} | {status}")
         
         params = param_counts.get(layer, 0)
         
@@ -571,7 +612,7 @@ def auto_quantize_joint(args):
             bits_scalar = w_bit if isinstance(w_bit, int) else 8
             total_mqf_storage_words += (params * bits_scalar) / reg_size
 
-    print("-" * 92)
+    print("-" * (44 + 11 * len(report_bits)))
     print(f"  Register Count (8-bit Baseline - HRP-Aware): {int(total_baseline_registers):,}")
     print(f"  MQF registers count:                         {int(total_mqf_registers):,}")
     
@@ -793,8 +834,8 @@ if __name__ == "__main__":
     parser.add_argument('--dataset', type=str, default='cifar10',
                         choices=['cifar10', 'cifar100', 'gtsrb', 'fashionmnist'],
                         help='Dataset name (default: cifar10)')
-    parser.add_argument('--bits', type=int, nargs='+', default=[4, 6, 8],
-                        help='List of bit-widths (default: 4 6 8, avoids 2-bit)')
+    parser.add_argument('--bits', type=int, nargs='+', default=[2, 3, 4, 8],
+                        help='List of bit-widths (default: 2 3 4 8)')
     parser.add_argument('--target-drop', type=float, default=3.0,
                         help='Target accuracy drop for search (default: 3.0%%)')
     parser.add_argument('--qat-threshold', type=float, default=5.0,
@@ -803,8 +844,14 @@ if __name__ == "__main__":
                         help='Output file for comprehensive metrics')
     parser.add_argument('--max-samples', type=int, default=1000,
                         help='Max samples for evaluation/profiling (default: 1000)')
+    parser.add_argument('--profile-samples', type=int, default=10000,
+                        help='Min samples for sensitivity profile generation (default: 10000)')
     parser.add_argument('--batch-size', type=int, default=128,
                         help='Evaluation batch size (default: 128; AlexNet auto-capped to 32)')
+    parser.add_argument('--max-layer-budget-share', type=float, default=0.35,
+                        help='Max fraction of target-drop spent in one layer during search (default: 0.35)')
+    parser.add_argument('--min-layers-to-modify', type=int, default=3,
+                        help='Minimum desired number of modified layers in search (default: 3)')
 
     # GTSRB-specific options
     parser.add_argument('--gtsrb-use-train-val', type=bool, default=False,
