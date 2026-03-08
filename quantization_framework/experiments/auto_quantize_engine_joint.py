@@ -502,11 +502,14 @@ def auto_quantize_joint(args):
     # ---------------------------------------------------------
     print("\n[STEP 3.1] Generating Hardware-Aware Registration Report...")
     
-    # Build a param count map for register calculations
+    # Build layer maps for register calculations
     param_counts = {}
+    channel_counts = {}
     for name, module in model.named_modules():
         if hasattr(module, 'weight') and module.weight is not None:
             param_counts[name] = module.weight.numel()
+            # For Conv/Linear, channel axis is output channels/features.
+            channel_counts[name] = module.weight.shape[0]
 
     print("\n[ALGO REPORT: REGISTER-MISMATCH ANALYSIS]")
     report_bits = sorted(set(int(b) for b in bit_choices))
@@ -574,10 +577,13 @@ def auto_quantize_joint(args):
         if isinstance(w_bit, list) and len(w_bit) > 0:
             from collections import Counter
             bit_counts = Counter(w_bit)
+            num_channels = channel_counts.get(layer, len(w_bit))
+            params_per_channel = (params / num_channels) if num_channels > 0 else 0.0
             mqf_regs = 0.0
             for bits, cnt in bit_counts.items():
                 d_sub = sim.find_max_packing_factor(int(bits), int(bits))
-                mqf_regs += cnt / max(d_sub, 1)
+                # cnt is number of channels at this bit-width; convert to parameter volume.
+                mqf_regs += (cnt * params_per_channel) / max(d_sub, 1)
         elif dist:
             mqf_regs = 0.0
             for bits_s, pct in dist.items():
