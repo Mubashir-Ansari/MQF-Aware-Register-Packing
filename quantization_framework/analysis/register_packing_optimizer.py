@@ -43,20 +43,33 @@ class LayerPackingReport:
     activation_bit_distribution: Dict[str, int]
     output_bit_distribution: Dict[str, int]
     average_bit_width: float
+    logical_storage_bits_weight: int
+    logical_storage_bits_activation: int
+    logical_storage_bits_output: int
+    total_logical_storage_bits: int
     weight_registers: int
     activation_registers: int
     output_registers: int
     total_operand_registers: int
     accumulator_registers_estimate: int
     utilization: float
+    avg_register_utilization: float
     slack_bits: int
     scalar_macs: int
     packed_issues: int
     reduction_factor: float
     packed_issue_reduction_factor: float
+    lane_utilization: float
+    effective_throughput_factor: float
+    max_safe_tile_size: int
+    overflow_risk: bool
+    requires_accumulator_tiling: bool
     storage_words_weight: int
     storage_words_activation: int
     storage_words_output: int
+    example_weight_registers: List[Dict[str, object]]
+    example_activation_registers: List[Dict[str, object]]
+    example_output_registers: List[Dict[str, object]]
     notes: str
 
 
@@ -66,10 +79,12 @@ class GlobalPackingReport:
     baseline_registers: int
     total_registers: int
     total_storage_words: int
+    total_logical_storage_bits: int
     total_slack_bits: int
     total_scalar_macs: int
     total_packed_issues: int
     total_reduction_factor: float
+    total_effective_throughput_factor: float
     savings_percent: float
     objective_cost: float
     per_layer_reports: List[LayerPackingReport]
@@ -321,6 +336,115 @@ def _aligned_width(b: int, aligned_policy: Dict[int, int]) -> int:
     return int(aligned_policy.get(int(b), int(b)))
 
 
+def _sample_fields_from_hist(
+    bit_hist: Dict[int, int],
+    tensor_kind: str,
+    layer_name: str,
+    aligned_policy: Optional[Dict[int, int]] = None,
+    limit_fields: int = 64,
+) -> List[PackedField]:
+    fields: List[PackedField] = []
+    idx = 0
+    for b in sorted(bit_hist.keys(), reverse=True):
+        aligned_b = _aligned_width(b, aligned_policy) if aligned_policy else int(b)
+        count = min(int(bit_hist[b]), max(0, limit_fields - idx))
+        for _ in range(count):
+            fields.append(
+                PackedField(
+                    tensor_kind=tensor_kind,
+                    layer_name=layer_name,
+                    group_id=f"{tensor_kind}_b{int(b)}",
+                    original_index=idx,
+                    bit_width=int(b),
+                    aligned_bit_width=int(aligned_b),
+                    register_id=-1,
+                    bit_offset=-1,
+                    signed=True,
+                )
+            )
+            idx += 1
+            if idx >= limit_fields:
+                return fields
+    return fields
+
+
+def _pack_sample_registers(
+    fields: List[PackedField],
+    register_size: int,
+    strategy: str,
+    mixed_width: bool,
+) -> List[PackedRegister]:
+    if not fields:
+        return []
+
+    regs: List[PackedRegister] = []
+    next_reg_id = 0
+
+    def _new_reg() -> PackedRegister:
+        nonlocal next_reg_id
+        reg = PackedRegister(
+            register_id=next_reg_id,
+            register_width=register_size,
+            strategy=strategy,
+            used_bits=0,
+            slack_bits=register_size,
+            fields=[],
+        )
+        next_reg_id += 1
+        return reg
+
+    if not mixed_width:
+        ordered = sorted(fields, key=lambda f: (f.aligned_bit_width, f.bit_width), reverse=True)
+        current: Optional[PackedRegister] = None
+        current_width: Optional[int] = None
+        for field in ordered:
+            width = int(field.aligned_bit_width)
+            if current is None or current_width != width or current.used_bits + width > register_size:
+                if current is not None:
+                    current.slack_bits = register_size - current.used_bits
+                    regs.append(current)
+                current = _new_reg()
+                current_width = width
+            new_field = PackedField(**asdict(field))
+            new_field.register_id = current.register_id
+            new_field.bit_offset = current.used_bits
+            current.fields.append(new_field)
+            current.used_bits += width
+        if current is not None:
+            current.slack_bits = register_size - current.used_bits
+            regs.append(current)
+        return regs
+
+    # Best-fit decreasing for mixed-width storage preview.
+    ordered = sorted(fields, key=lambda f: (f.aligned_bit_width, f.bit_width), reverse=True)
+    for field in ordered:
+        width = int(field.aligned_bit_width)
+        candidate_idx = None
+        candidate_residual = None
+        for i, reg in enumerate(regs):
+            residual = register_size - reg.used_bits
+            if residual >= width:
+                post = residual - width
+                if candidate_residual is None or post < candidate_residual:
+                    candidate_idx = i
+                    candidate_residual = post
+        if candidate_idx is None:
+            regs.append(_new_reg())
+            candidate_idx = len(regs) - 1
+        reg = regs[candidate_idx]
+        new_field = PackedField(**asdict(field))
+        new_field.register_id = reg.register_id
+        new_field.bit_offset = reg.used_bits
+        reg.fields.append(new_field)
+        reg.used_bits += width
+        reg.slack_bits = register_size - reg.used_bits
+    return regs
+
+
+def _serialize_registers(registers: List[PackedRegister]) -> List[Dict[str, object]]:
+    return [asdict(r) for r in registers]
+
+
 def _raw_words_and_slack(bit_hist: Dict[int, int], register_size: int, aligned_policy: Optional[Dict[int, int]] = None) -> Tuple[int, int, int]:
     words = 0
     used_bits = 0
@@ -400,6 +524,15 @@ def _compute_tile_d(bw: int, ba: int, register_size: int, acc_width: int) -> int
     return max(1, min(d_w, d_a, t_acc))
 
 
+def _compute_tile_metrics(bw: int, ba: int, register_size: int, acc_width: int) -> Tuple[int, int, int, int]:
+    d_w = max(1, register_size // max(bw, 1))
+    d_a = max(1, register_size // max(ba, 1))
+    max_prod = max(1, (2 ** max(bw - 1, 1) - 1) * (2 ** max(ba - 1, 1) - 1))
+    t_acc = max(1, (2 ** max(acc_width - 1, 1) - 1) // max_prod)
+    tile = max(1, min(d_w, d_a, t_acc))
+    return d_w, d_a, t_acc, tile
+
+
 def _compute_packed_issues(
     meta: LayerMeta,
     weight_channel_hist: Dict[int, int],
@@ -407,9 +540,12 @@ def _compute_packed_issues(
     register_size: int,
     acc_width: int,
     aligned_policy: Dict[int, int],
-) -> int:
+) -> Tuple[int, float, int, bool]:
     total_channels = max(1, meta.out_units)
     issues = 0
+    tile_weighted_sum = 0.0
+    min_safe_tile = None
+    overflow_risk = False
     for b, c in weight_channel_hist.items():
         frac = c / total_channels
         scalar_group = int(round(meta.scalar_macs * frac))
@@ -420,9 +556,15 @@ def _compute_packed_issues(
         if strategy == "aligned":
             bw = _aligned_width(bw, aligned_policy)
             ba = _aligned_width(ba, aligned_policy)
-        d = _compute_tile_d(bw, ba, register_size, acc_width)
+        _, _, t_acc, d = _compute_tile_metrics(bw, ba, register_size, acc_width)
         issues += int(math.ceil(scalar_group / d))
-    return max(1, int(issues))
+        tile_weighted_sum += d * frac
+        min_safe_tile = d if min_safe_tile is None else min(min_safe_tile, d)
+        if meta.reduction_dim > t_acc:
+            overflow_risk = True
+    issues = max(1, int(issues))
+    avg_lane_util = (meta.scalar_macs / issues) if issues > 0 else 1.0
+    return issues, float(tile_weighted_sum), int(min_safe_tile or 1), bool(overflow_risk)
 
 
 def _hist_to_str_count(hist: Dict[int, int]) -> Dict[str, int]:
@@ -442,6 +584,7 @@ def _make_layer_reports(
     reports: List[LayerPackingReport] = []
     prev_output_hist: Optional[Dict[int, int]] = None
     prev_output_elems: Optional[int] = None
+    simulator = PackedMACSimulator(register_size=register_size, acc_width=acc_width)
 
     for meta in metas:
         w_cfg = weight_cfg.get(meta.name, 8)
@@ -460,22 +603,130 @@ def _make_layer_reports(
             w_words, w_slack, w_used = _raw_words_and_slack(weight_elem_hist, register_size, None)
             a_words, a_slack, a_used = _raw_words_and_slack(input_elem_hist, register_size, None)
             o_words, o_slack, o_used = _raw_words_and_slack(output_elem_hist, register_size, None)
-            packed_issues = _compute_packed_issues(meta, weight_channel_hist, "raw", register_size, acc_width, aligned_policy)
+            packed_issues, lane_util, max_safe_tile, overflow_risk = _compute_packed_issues(
+                meta, weight_channel_hist, "raw", register_size, acc_width, aligned_policy
+            )
+            weight_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(weight_elem_hist, "weight", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=False,
+                )
+            )
+            act_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(input_elem_hist, "activation", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=False,
+                )
+            )
+            out_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(output_elem_hist, "output", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=False,
+                )
+            )
+            strategy_notes = "Exact-width homogeneous packing for storage and grouped compute."
         elif strategy == "aligned":
             w_words, w_slack, w_used = _raw_words_and_slack(weight_elem_hist, register_size, aligned_policy)
             a_words, a_slack, a_used = _raw_words_and_slack(input_elem_hist, register_size, aligned_policy)
             o_words, o_slack, o_used = _raw_words_and_slack(output_elem_hist, register_size, aligned_policy)
-            packed_issues = _compute_packed_issues(meta, weight_channel_hist, "aligned", register_size, acc_width, aligned_policy)
+            packed_issues, lane_util, max_safe_tile, overflow_risk = _compute_packed_issues(
+                meta, weight_channel_hist, "aligned", register_size, acc_width, aligned_policy
+            )
+            weight_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(weight_elem_hist, "weight", meta.name, aligned_policy),
+                    register_size,
+                    strategy,
+                    mixed_width=False,
+                )
+            )
+            act_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(input_elem_hist, "activation", meta.name, aligned_policy),
+                    register_size,
+                    strategy,
+                    mixed_width=False,
+                )
+            )
+            out_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(output_elem_hist, "output", meta.name, aligned_policy),
+                    register_size,
+                    strategy,
+                    mixed_width=False,
+                )
+            )
+            strategy_notes = "Aligned slot packing; 3-bit values are widened per alignment policy."
         elif strategy == "heterogeneous_storage":
             w_words, w_slack, w_used = _heterogeneous_words_and_slack(weight_elem_hist, register_size)
             a_words, a_slack, a_used = _heterogeneous_words_and_slack(input_elem_hist, register_size)
             o_words, o_slack, o_used = _heterogeneous_words_and_slack(output_elem_hist, register_size)
-            packed_issues = _compute_packed_issues(meta, weight_channel_hist, "raw", register_size, acc_width, aligned_policy)
+            packed_issues, lane_util, max_safe_tile, overflow_risk = _compute_packed_issues(
+                meta, weight_channel_hist, "raw", register_size, acc_width, aligned_policy
+            )
+            weight_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(weight_elem_hist, "weight", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=True,
+                )
+            )
+            act_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(input_elem_hist, "activation", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=True,
+                )
+            )
+            out_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(output_elem_hist, "output", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=True,
+                )
+            )
+            strategy_notes = "Mixed-width storage packing only; compute metrics assume regrouped exact-width execution."
         elif strategy == "hybrid_storage_compute":
             w_words, w_slack, w_used = _heterogeneous_words_and_slack(weight_elem_hist, register_size)
             a_words, a_slack, a_used = _heterogeneous_words_and_slack(input_elem_hist, register_size)
             o_words, o_slack, o_used = _heterogeneous_words_and_slack(output_elem_hist, register_size)
-            packed_issues = _compute_packed_issues(meta, weight_channel_hist, "raw", register_size, acc_width, aligned_policy)
+            packed_issues, lane_util, max_safe_tile, overflow_risk = _compute_packed_issues(
+                meta, weight_channel_hist, "raw", register_size, acc_width, aligned_policy
+            )
+            weight_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(weight_elem_hist, "weight", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=True,
+                )
+            )
+            act_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(input_elem_hist, "activation", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=True,
+                )
+            )
+            out_regs_sample = _serialize_registers(
+                _pack_sample_registers(
+                    _sample_fields_from_hist(output_elem_hist, "output", meta.name, None),
+                    register_size,
+                    strategy,
+                    mixed_width=True,
+                )
+            )
+            strategy_notes = "Compact storage with regular compute-time repacking grouped by exact bit-width."
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -485,6 +736,7 @@ def _make_layer_reports(
         slack_bits = int(w_slack + a_slack + o_slack)
         util = (used_bits / alloc_bits) if alloc_bits > 0 else 0.0
         reduction = (meta.scalar_macs / packed_issues) if packed_issues > 0 else 1.0
+        requires_acc_tiling = bool(meta.reduction_dim > max_safe_tile)
 
         # Output-accumulator estimate for reference (upper-bound style).
         acc_regs = int(meta.output_elements)
@@ -492,6 +744,13 @@ def _make_layer_reports(
         avg_b = 0.0
         if meta.num_params > 0:
             avg_b = sum(int(k) * int(v) for k, v in weight_elem_hist.items()) / meta.num_params
+
+        logical_w_bits = int(sum(int(k) * int(v) for k, v in weight_elem_hist.items()))
+        logical_a_bits = int(sum(int(k) * int(v) for k, v in input_elem_hist.items()))
+        logical_o_bits = int(sum(int(k) * int(v) for k, v in output_elem_hist.items()))
+
+        throughput_factor = float(reduction)
+        avg_lane_utilization = float(util)
 
         reports.append(
             LayerPackingReport(
@@ -503,21 +762,34 @@ def _make_layer_reports(
                 activation_bit_distribution=_hist_to_str_count(input_elem_hist),
                 output_bit_distribution=_hist_to_str_count(output_elem_hist),
                 average_bit_width=float(round(avg_b, 4)),
+                logical_storage_bits_weight=logical_w_bits,
+                logical_storage_bits_activation=logical_a_bits,
+                logical_storage_bits_output=logical_o_bits,
+                total_logical_storage_bits=int(logical_w_bits + logical_a_bits + logical_o_bits),
                 weight_registers=int(w_words),
                 activation_registers=int(a_words),
                 output_registers=int(o_words),
                 total_operand_registers=int(total_regs),
                 accumulator_registers_estimate=int(acc_regs),
                 utilization=float(round(util, 6)),
+                avg_register_utilization=float(round(avg_lane_utilization, 6)),
                 slack_bits=int(slack_bits),
                 scalar_macs=int(meta.scalar_macs),
                 packed_issues=int(packed_issues),
                 reduction_factor=float(round(reduction, 6)),
                 packed_issue_reduction_factor=float(round(reduction, 6)),
+                lane_utilization=float(round(lane_util, 6)),
+                effective_throughput_factor=float(round(throughput_factor, 6)),
+                max_safe_tile_size=int(max_safe_tile),
+                overflow_risk=bool(overflow_risk),
+                requires_accumulator_tiling=bool(requires_acc_tiling),
                 storage_words_weight=int(w_words),
                 storage_words_activation=int(a_words),
                 storage_words_output=int(o_words),
-                notes=f"reduction_dim={meta.reduction_dim}, out_elems={meta.output_elements}",
+                example_weight_registers=weight_regs_sample,
+                example_activation_registers=act_regs_sample,
+                example_output_registers=out_regs_sample,
+                notes=f"{strategy_notes} reduction_dim={meta.reduction_dim}, out_elems={meta.output_elements}",
             )
         )
 
@@ -538,6 +810,7 @@ def _aggregate_global(
 ) -> GlobalPackingReport:
     total_regs = sum(r.total_operand_registers for r in per_layer)
     total_storage = sum(r.storage_words_weight + r.storage_words_activation + r.storage_words_output for r in per_layer)
+    total_logical_bits = sum(r.total_logical_storage_bits for r in per_layer)
     total_slack = sum(r.slack_bits for r in per_layer)
     scalar = sum(r.scalar_macs for r in per_layer)
     issues = sum(r.packed_issues for r in per_layer)
@@ -554,10 +827,12 @@ def _aggregate_global(
         baseline_registers=int(baseline_registers),
         total_registers=int(total_regs),
         total_storage_words=int(total_storage),
+        total_logical_storage_bits=int(total_logical_bits),
         total_slack_bits=int(total_slack),
         total_scalar_macs=int(scalar),
         total_packed_issues=int(issues),
         total_reduction_factor=float(round(reduction, 6)),
+        total_effective_throughput_factor=float(round(reduction, 6)),
         savings_percent=float(round(savings, 4)),
         objective_cost=float(round(cost, 4)),
         per_layer_reports=per_layer,
@@ -584,15 +859,22 @@ def _write_outputs(
         "layer_type",
         "num_parameters",
         "average_bit_width",
+        "total_logical_storage_bits",
         "weight_registers",
         "activation_registers",
         "output_registers",
         "total_operand_registers",
         "utilization",
+        "avg_register_utilization",
         "slack_bits",
         "scalar_macs",
         "packed_issues",
         "packed_issue_reduction_factor",
+        "lane_utilization",
+        "effective_throughput_factor",
+        "max_safe_tile_size",
+        "overflow_risk",
+        "requires_accumulator_tiling",
         "storage_words_weight",
         "storage_words_activation",
         "storage_words_output",
@@ -609,15 +891,22 @@ def _write_outputs(
                         "layer_type": lr.layer_type,
                         "num_parameters": lr.num_parameters,
                         "average_bit_width": lr.average_bit_width,
+                        "total_logical_storage_bits": lr.total_logical_storage_bits,
                         "weight_registers": lr.weight_registers,
                         "activation_registers": lr.activation_registers,
                         "output_registers": lr.output_registers,
                         "total_operand_registers": lr.total_operand_registers,
                         "utilization": lr.utilization,
+                        "avg_register_utilization": lr.avg_register_utilization,
                         "slack_bits": lr.slack_bits,
                         "scalar_macs": lr.scalar_macs,
                         "packed_issues": lr.packed_issues,
                         "packed_issue_reduction_factor": lr.packed_issue_reduction_factor,
+                        "lane_utilization": lr.lane_utilization,
+                        "effective_throughput_factor": lr.effective_throughput_factor,
+                        "max_safe_tile_size": lr.max_safe_tile_size,
+                        "overflow_risk": lr.overflow_risk,
+                        "requires_accumulator_tiling": lr.requires_accumulator_tiling,
                         "storage_words_weight": lr.storage_words_weight,
                         "storage_words_activation": lr.storage_words_activation,
                         "storage_words_output": lr.storage_words_output,
@@ -629,16 +918,18 @@ def _write_outputs(
     with open(md_path, "w") as f:
         f.write("# Register Packing Strategy Comparison\n\n")
         f.write("## Global Table\n\n")
-        f.write("| Strategy | Total Registers | Savings vs Baseline A | Total Storage Words | Packed Issue Reduction | Objective Cost |\n")
-        f.write("|---|---:|---:|---:|---:|---:|\n")
+        f.write("| Strategy | Total Registers | Savings vs Baseline A | Total Storage Words | Logical Bits | Packed Issue Reduction | Objective Cost |\n")
+        f.write("|---|---:|---:|---:|---:|---:|---:|\n")
         for r in sorted_reports:
             f.write(
                 f"| {r.strategy_name} | {r.total_registers:,} | {r.savings_percent:.2f}% | "
-                f"{r.total_storage_words:,} | {r.total_reduction_factor:.3f}x | {r.objective_cost:.2f} |\n"
+                f"{r.total_storage_words:,} | {r.total_logical_storage_bits:,} | {r.total_reduction_factor:.3f}x | {r.objective_cost:.2f} |\n"
             )
         f.write("\n")
         f.write(f"- Baseline A (uniform 8-bit): {baseline_a.total_registers:,} registers\n")
         f.write(f"- Baseline B (MQF raw): {baseline_b_raw.total_registers:,} registers\n")
+        if "aligned" in reports:
+            f.write(f"- Baseline C (MQF aligned): {reports['aligned'].total_registers:,} registers\n")
         if sorted_reports:
             f.write(f"- Best overall by objective: **{sorted_reports[0].strategy_name}**\n")
 
@@ -670,6 +961,12 @@ def _write_outputs(
         f.write("-" * 70 + "\n")
         if sorted_reports:
             f.write(f"Best strategy overall: {sorted_reports[0].strategy_name}\n")
+            f.write("Storage vs compute separation:\n")
+            for r in sorted_reports:
+                f.write(
+                    f"  - {r.strategy_name}: storage_words={r.total_storage_words:,}, "
+                    f"packed_issue_reduction={r.total_reduction_factor:.3f}x\n"
+                )
         f.write("Layers with largest register use under MQF raw:\n")
         b_raw_layers = sorted(
             baseline_b_raw.per_layer_reports,
