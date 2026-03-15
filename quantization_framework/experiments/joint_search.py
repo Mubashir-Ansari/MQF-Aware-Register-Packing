@@ -371,7 +371,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.output is None:
-        args.output = f"{args.model}_config_hybrid.json"
+        bits_tag = "_".join(str(b) for b in args.bits)
+        args.output = f"{args.model}_config_{bits_tag}.json"
 
     sensitivity = load_joint_sensitivity(args.profile)
     num_classes = 100 if args.dataset == 'cifar100' else (43 if args.dataset == 'gtsrb' else 10)
