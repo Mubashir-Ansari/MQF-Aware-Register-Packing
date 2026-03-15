@@ -499,146 +499,17 @@ def auto_quantize_joint(args):
     model = load_model(model_name, checkpoint_path=checkpoint_path, num_classes=num_classes)
     
     # ---------------------------------------------------------
-    # STEP 3.1: GENERATE ALGO REPORT: REGISTER-MISMATCH ANALYSIS
+    # STEP 3.1: HARDWARE REPORTING NOTE
     # ---------------------------------------------------------
-    print("\n[STEP 3.1] Generating Hardware-Aware Registration Report...")
-    
-    # Build layer maps for register calculations
-    param_counts = {}
-    channel_counts = {}
-    for name, module in model.named_modules():
-        if hasattr(module, 'weight') and module.weight is not None:
-            param_counts[name] = module.weight.numel()
-            # For Conv/Linear, channel axis is output channels/features.
-            channel_counts[name] = module.weight.shape[0]
-
-    print("\n[ALGO REPORT: REGISTER-MISMATCH ANALYSIS]")
-    report_bits = sorted(set(int(b) for b in bit_choices))
-    bit_headers = " | ".join([f"{b}b %".rjust(7) for b in report_bits])
-    print(f"{'Layer':12} | {bit_headers} | {'Pack (A)':8} | {'Ew':5} | {'Status'}")
-    print("-" * (44 + 11 * len(report_bits)))
-    
-    # Fair comparison: Baseline (8-bit) should also be subjected to HRP constraints
-    from quantization.hardware_sim import RegisterPackingSimulator
-    from quantization.packing import ReQAPPackingPlanner
-    reg_size = hrp_metadata.get('register_size', 16)
-    sim = RegisterPackingSimulator(reg_size)
-    planner = ReQAPPackingPlanner(register_size=reg_size, max_d=8)
-    d_base = sim.find_max_packing_factor(8, 8) # Baseline is 8-bit Weight/Activation
-    
-    total_baseline_registers = 0
-    total_mqf_registers = 0
-    total_baseline_storage_words = 0
-    total_mqf_storage_words = 0
-    
-    for layer, c in joint_config_data['config'].items():
-        dist = c.get('granular_dist', {})
-        bit_percentages = {int(b): 0.0 for b in report_bits}
-
-        w_bit = c.get('weight', 8)
-        if not dist:
-            if isinstance(w_bit, list):
-                total = len(w_bit)
-                if total > 0:
-                    for b in report_bits:
-                        bit_percentages[b] = 100.0 * sum(1 for x in w_bit if int(x) == b) / total
-            else:
-                bw = int(w_bit) if isinstance(w_bit, int) else 8
-                if bw in bit_percentages:
-                    bit_percentages[bw] = 100.0
-        else:
-            for bits_s, pct in dist.items():
-                try:
-                    bits_i = int(bits_s)
-                except ValueError:
-                    continue
-                if bits_i in bit_percentages:
-                    bit_percentages[bits_i] = float(pct)
-
-        pack_a = c.get('packing_factor', 1.0)
-        status = "GRANULAR" if isinstance(w_bit, list) or len(dist) > 1 else "UNIFORM"
-
-        if isinstance(w_bit, list) and len(w_bit) > 0:
-            eff_w_bits = int(round(sum(w_bit) / len(w_bit)))
-        elif dist:
-            eff_w_bits = int(round(sum(int(k) * (v / 100.0) for k, v in dist.items() if str(k).isdigit())))
-        else:
-            eff_w_bits = int(w_bit) if isinstance(w_bit, int) else 8
-        plan = planner.plan(eff_w_bits, eff_w_bits)
-
-        bit_cols = " | ".join([f"{bit_percentages[b]:>6.1f}%" for b in report_bits])
-        print(f"{layer:12} | {bit_cols} | {pack_a:<8.2f} | {plan.empty_bits_weight:<5d} | {status}")
-        
-        params = param_counts.get(layer, 0)
-        
-        # d_base is the FAIR packing for 8-bit baseline on the same hardware
-        base_regs = params / d_base
-
-        # Exact granular accounting: regs = sum(params_frac / d_frac)
-        if isinstance(w_bit, list) and len(w_bit) > 0:
-            from collections import Counter
-            bit_counts = Counter(w_bit)
-            num_channels = channel_counts.get(layer, len(w_bit))
-            params_per_channel = (params / num_channels) if num_channels > 0 else 0.0
-            mqf_regs = 0.0
-            for bits, cnt in bit_counts.items():
-                d_sub = sim.find_max_packing_factor(int(bits), int(bits))
-                # cnt is number of channels at this bit-width; convert to parameter volume.
-                mqf_regs += (cnt * params_per_channel) / max(d_sub, 1)
-        elif dist:
-            mqf_regs = 0.0
-            for bits_s, pct in dist.items():
-                try:
-                    bits_i = int(bits_s)
-                except ValueError:
-                    continue
-                d_sub = sim.find_max_packing_factor(bits_i, bits_i)
-                mqf_regs += (params * (pct / 100.0)) / max(d_sub, 1)
-        else:
-            mqf_regs = params / pack_a if pack_a > 0 else base_regs
-        
-        total_baseline_registers += base_regs
-        total_mqf_registers += mqf_regs
-
-        # Raw storage packing perspective (without accumulation safety bound):
-        # number of R-bit words needed for weights.
-        # Baseline is fixed 8-bit weights.
-        total_baseline_storage_words += (params * 8.0) / reg_size
-        if isinstance(w_bit, list) and len(w_bit) > 0:
-            total_mqf_storage_words += (sum(w_bit) / reg_size) * (params / len(w_bit))
-        elif dist:
-            weighted_bits = 0.0
-            for bits_s, pct in dist.items():
-                try:
-                    bits_i = int(bits_s)
-                except ValueError:
-                    continue
-                weighted_bits += bits_i * (pct / 100.0)
-            total_mqf_storage_words += (params * weighted_bits) / reg_size
-        else:
-            bits_scalar = w_bit if isinstance(w_bit, int) else 8
-            total_mqf_storage_words += (params * bits_scalar) / reg_size
-
-    print("-" * (44 + 11 * len(report_bits)))
-    print(f"  Register Count (8-bit Baseline - HRP-Aware): {int(total_baseline_registers):,}")
-    print(f"  MQF registers count:                         {int(total_mqf_registers):,}")
-    
-    storage_efficiency = (total_baseline_registers / total_mqf_registers * 100) if total_mqf_registers > 0 else 0
-    # For user report, we want to show SAVINGS
-    savings = (1.0 - (total_mqf_registers / total_baseline_registers)) * 100 if total_baseline_registers > 0 else 0
-    print(f"  Estimated Register Savings:                  {savings:.2f}%")
-    storage_savings = (1.0 - (total_mqf_storage_words / total_baseline_storage_words)) * 100 if total_baseline_storage_words > 0 else 0
-    print(f"  Storage Words (R={reg_size}b, baseline 8b): {int(total_baseline_storage_words):,}")
-    print(f"  MQF storage words (packed by bit-width):     {int(total_mqf_storage_words):,}")
-    print(f"  Estimated Storage Savings:                   {storage_savings:.2f}%")
-    base_plan = planner.plan(8, 8, d=d_base)
-    print(f"  Packed ops supported:                        {', '.join(base_plan.ops_supported)}")
-    if weighted_avg_packing_factor is not None:
-        print(f"  Weighted Avg Packing (param-weighted):       {weighted_avg_packing_factor:.2f}")
-    if weighted_throughput_gain is not None:
-        print(f"  Weighted Throughput Gain:                    {weighted_throughput_gain:.2f}x")
-    print(f"  Quantization Mode:                           JOINT W=A")
-    print("-" * 70)
+    print("\n[STEP 3.1] Hardware Reporting")
+    if getattr(args, "run_packing_analysis", False):
+        print("  Legacy HRP-only register reporting is disabled.")
+        print("  Primary hardware results will be reported in Step 7 from the")
+        print("  post-MQF packing analysis module using storage + packed-issue metrics.")
+    else:
+        print("  Legacy HRP-only register reporting is disabled.")
+        print("  Use --run-packing-analysis to generate the primary hardware report")
+        print("  with weight, activation, output, and packed-issue summaries.")
 
     # Remove redundant device detection later down
     print(f"[ENGINE] Using device: {device}")
@@ -866,13 +737,22 @@ def auto_quantize_joint(args):
                 default_input_bits=getattr(args, "default_input_bits", 8),
                 device=device,
             )
-            print("[PACKING] Completed. Strategy summary:")
+            print("[PACKING] Completed. Storage + compute summary:")
             for sname in ["raw_homogeneous", "aligned", "heterogeneous_storage", "hybrid_storage_compute"]:
                 r = reports[sname]
                 print(
-                    f"  {sname:24s} | regs={r.total_registers:,} | "
-                    f"savings={r.savings_percent:.2f}% | issue_red={r.total_reduction_factor:.3f}x"
+                    f"  {sname:24s} | operand_words={r.total_registers:,} | "
+                    f"storage_savings={r.savings_percent:.2f}% | packed_issue_reduction={r.total_reduction_factor:.3f}x"
                 )
+            base_r = reports["baseline_uniform_8bit"]
+            best_name = min(
+                ["raw_homogeneous", "aligned", "heterogeneous_storage", "hybrid_storage_compute"],
+                key=lambda n: reports[n].objective_cost
+            )
+            best_r = reports[best_name]
+            print(f"  baseline_uniform_8bit      | operand_words={base_r.total_registers:,} | storage_savings=0.00% | packed_issue_reduction={base_r.total_reduction_factor:.3f}x")
+            print(f"[PACKING] Best strategy by objective: {best_name}")
+            print(f"[PACKING] Best strategy totals: operand_words={best_r.total_registers:,}, packed_issue_reduction={best_r.total_reduction_factor:.3f}x")
             print(f"[PACKING] Reports saved to: {packing_output_dir}")
         except Exception as e:
             print(f"[PACKING] WARNING: analysis failed: {e}")
