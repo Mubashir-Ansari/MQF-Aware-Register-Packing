@@ -219,8 +219,14 @@ def hrp_greedy_search(
         if not valid_moves:
             break
             
-        valid_moves.sort(key=lambda x: x['score'], reverse=True)
-        best_candidate = valid_moves[0]
+        if len(set(m['layer'] for m in moves_made)) < min_layers_to_modify:
+            unseen_layer_moves = [m for m in valid_moves if m['layer'] not in {mm['layer'] for mm in moves_made}]
+            candidate_pool = unseen_layer_moves if unseen_layer_moves else valid_moves
+        else:
+            candidate_pool = valid_moves
+
+        candidate_pool.sort(key=lambda x: x['score'], reverse=True)
+        best_candidate = candidate_pool[0]
         layer = best_candidate['layer']
         
         remaining_budget = target_drop - current_drop
@@ -359,6 +365,7 @@ if __name__ == "__main__":
     parser.add_argument('--bits', type=int, nargs='+', default=[2, 3, 4, 8])
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--max-layer-budget-share', type=float, default=0.35)
+    parser.add_argument('--min-layers-to-modify', type=int, default=3)
     parser.add_argument('--baseline-acc', type=float, default=None)
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
@@ -376,6 +383,7 @@ if __name__ == "__main__":
         sensitivity, args.bits, target_drop=args.target_drop,
         register_size=args.register_size, filter_counts=filter_counts,
         param_counts=param_counts, max_layer_budget_share=args.max_layer_budget_share,
+        min_layers_to_modify=args.min_layers_to_modify,
         baseline_acc=args.baseline_acc
     )
     save_config(config, args.output, stats)
