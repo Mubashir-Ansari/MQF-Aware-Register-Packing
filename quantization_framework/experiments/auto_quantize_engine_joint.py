@@ -502,6 +502,41 @@ def auto_quantize_joint(args):
     # STEP 3.1: HARDWARE REPORTING NOTE
     # ---------------------------------------------------------
     print("\n[STEP 3.1] Hardware Reporting")
+    print("\n[BIT DISTRIBUTION SUMMARY]")
+    report_bits = sorted(set(int(b) for b in bit_choices))
+    bit_headers = " | ".join([f"{b}b %".rjust(7) for b in report_bits])
+    print(f"{'Layer':12} | {bit_headers} | {'Status'}")
+    print("-" * (28 + 11 * len(report_bits)))
+
+    for layer, c in joint_config_data['config'].items():
+        dist = c.get('granular_dist', {})
+        bit_percentages = {int(b): 0.0 for b in report_bits}
+        w_bit = c.get('weight', 8)
+
+        if not dist:
+            if isinstance(w_bit, list):
+                total = len(w_bit)
+                if total > 0:
+                    for b in report_bits:
+                        bit_percentages[b] = 100.0 * sum(1 for x in w_bit if int(x) == b) / total
+            else:
+                bw = int(w_bit) if isinstance(w_bit, int) else 8
+                if bw in bit_percentages:
+                    bit_percentages[bw] = 100.0
+        else:
+            for bits_s, pct in dist.items():
+                try:
+                    bits_i = int(bits_s)
+                except ValueError:
+                    continue
+                if bits_i in bit_percentages:
+                    bit_percentages[bits_i] = float(pct)
+
+        status = "GRANULAR" if isinstance(w_bit, list) or len(dist) > 1 else "UNIFORM"
+        bit_cols = " | ".join([f"{bit_percentages[b]:>6.1f}%" for b in report_bits])
+        print(f"{layer:12} | {bit_cols} | {status}")
+
+    print("-" * (28 + 11 * len(report_bits)))
     if getattr(args, "run_packing_analysis", False):
         print("  Legacy HRP-only register reporting is disabled.")
         print("  Primary hardware results will be reported in Step 7 from the")
