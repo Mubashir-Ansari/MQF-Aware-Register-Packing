@@ -55,6 +55,42 @@ def get_layer_param_counts(model):
             counts[name] = module.weight.numel()
     return counts
 
+def _ensure_bit_list(config_entry, num_units):
+    """Return an explicit per-unit bit list for iterative granular refinement."""
+    if num_units <= 0:
+        return []
+    if 'bit_list' in config_entry and isinstance(config_entry['bit_list'], list):
+        bit_list = [int(b) for b in config_entry['bit_list']]
+        if len(bit_list) == num_units:
+            return bit_list
+    return [int(config_entry['w_bits'])] * num_units
+
+def _avg_packing_from_bits(bit_list, sim):
+    if not bit_list:
+        return 1.0
+    return sum(sim.find_max_packing_factor(int(b), int(b)) for b in bit_list) / len(bit_list)
+
+def _granular_dist_from_bits(bit_list):
+    counts = {}
+    total = len(bit_list)
+    for b in bit_list:
+        counts[int(b)] = counts.get(int(b), 0) + 1
+    return {str(b): round((counts[b] / total) * 100.0, 1) for b in sorted(counts.keys())}
+
+def _replace_bits(bit_list, source_bit, target_bit, num_to_move):
+    """Deterministically lower the first num_to_move units from source_bit to target_bit."""
+    if num_to_move <= 0:
+        return list(bit_list)
+    out = list(bit_list)
+    moved = 0
+    for i, b in enumerate(out):
+        if int(b) == int(source_bit):
+            out[i] = int(target_bit)
+            moved += 1
+            if moved >= num_to_move:
+                break
+    return out
+
 def hrp_greedy_search(
     sensitivity,
     bit_choices,
@@ -105,9 +141,11 @@ def hrp_greedy_search(
         else:
             tier_map[layer] = "Tier 3 (Robust)"
 
+    # Track cumulative estimated drop per layer to keep iterative refinement bounded.
     moves_made = []
     current_drop = 0.0
     per_layer_drop_cap = max_layer_budget_share * target_drop
+    layer_drop_spent = {layer: 0.0 for layer in sensitivity.keys()}
 
     print(f"\n[METRIC] Multi-Pass Search initialized...")
 
@@ -115,8 +153,9 @@ def hrp_greedy_search(
     while current_drop < target_drop:
         valid_moves = []
         for layer, scores in list(sensitivity.items()):
-            current_w = config[layer]['w_bits']
-            current_d = config[layer]['d']
+            num_units = (filter_counts or {}).get(layer, 1)
+            bit_list = _ensure_bit_list(config[layer], num_units)
+            current_d = _avg_packing_from_bits(bit_list, sim)
             
             # Constraint Enforcement
             tier = tier_map.get(layer, "Tier 3")
@@ -124,32 +163,56 @@ def hrp_greedy_search(
             if "Tier 1" in tier: min_bits = 8
             if "Tier 2" in tier: min_bits = 4
 
-            for bits in bit_choices_sorted:
-                if bits >= current_w: continue
-                if bits < min_bits: continue
-                
-                if bits in scores:
+            present_bits = sorted(set(int(b) for b in bit_list), reverse=True)
+            for source_bit in present_bits:
+                if source_bit <= min_bits:
+                    continue
+                eligible_units = sum(1 for b in bit_list if int(b) == source_bit)
+                if eligible_units <= 0:
+                    continue
+
+                source_drop = scores.get(source_bit, 0.0)
+                future_gain_exists = any(
+                    lower in scores and lower < source_bit and sim.find_max_packing_factor(lower, lower) > sim.find_max_packing_factor(source_bit, source_bit)
+                    for lower in bit_choices_sorted
+                )
+
+                for bits in bit_choices_sorted:
+                    if bits >= source_bit:
+                        continue
+                    if bits < min_bits:
+                        continue
+                    if bits not in scores:
+                        continue
+
                     drop_val = scores[bits]
-                    # Marginal drop = Total(bits) - Total(current_w)
-                    current_total_drop = scores.get(current_w, 0.0)
-                    marginal_drop = max(0.0, drop_val - current_total_drop)
-                    
-                    new_d = sim.find_max_packing_factor(bits, bits)
+                    full_marginal_drop = max(0.0, drop_val - source_drop)
+                    moved_fraction_full = eligible_units / max(len(bit_list), 1)
+                    predicted_drop = full_marginal_drop * moved_fraction_full
+
+                    new_bit_list = _replace_bits(bit_list, source_bit, bits, eligible_units)
+                    new_d = _avg_packing_from_bits(new_bit_list, sim)
                     d_gain = new_d - current_d
                     layer_params = (param_counts or {}).get(layer, 1)
                     reg_gain = layer_params * ((1.0 / max(current_d, 1e-9)) - (1.0 / max(new_d, 1e-9)))
 
-                    if d_gain > 0 or (bits < current_w and marginal_drop < 0.2):
-                        # Intelligence-driven Scoring (Reg gain per bit-drop cost)
-                        score = reg_gain / (marginal_drop + 0.01)
+                    unlock_bonus = 0.0
+                    if d_gain <= 0 and future_gain_exists and full_marginal_drop <= 3.0:
+                        unlock_bonus = 0.10 * layer_params
+
+                    if reg_gain > 0 or unlock_bonus > 0:
+                        score = (reg_gain + unlock_bonus) / (predicted_drop + 0.01)
                         valid_moves.append({
                             'layer': layer,
                             'w_bits': bits,
                             'a_bits': bits,
-                            'old_bits': current_w,
+                            'old_bits': source_bit,
                             'd': new_d,
                             'reg_gain': reg_gain,
-                            'drop': marginal_drop,
+                            'drop': predicted_drop,
+                            'full_marginal_drop': full_marginal_drop,
+                            'eligible_units': eligible_units,
+                            'current_bit_list': bit_list,
                             'score': score
                         })
         
@@ -161,7 +224,8 @@ def hrp_greedy_search(
         layer = best_candidate['layer']
         
         remaining_budget = target_drop - current_drop
-        allowed_drop = min(remaining_budget, per_layer_drop_cap)
+        remaining_layer_cap = max(0.0, per_layer_drop_cap - layer_drop_spent[layer])
+        allowed_drop = min(remaining_budget, remaining_layer_cap)
         
         if best_candidate['drop'] > allowed_drop:
             if allowed_drop <= 0: break
@@ -174,31 +238,49 @@ def hrp_greedy_search(
             else: fraction = min(fraction, 0.95) 
 
             if fraction < 0.02: 
-                sensitivity.pop(layer)
                 continue
 
             best_candidate['is_granular'] = True
             best_candidate['fraction'] = fraction
             best_candidate['drop'] = allowed_drop
-            new_d = best_candidate['d']
-            old_d = config[layer]['d']
-            best_candidate['d'] = (fraction * new_d) + ((1 - fraction) * old_d)
-            
-            best_candidate['granular_weights'] = {
-                str(best_candidate['w_bits']): round(fraction * 100, 1),
-                str(best_candidate['old_bits']): round((1 - fraction) * 100, 1)
-            }
-            sensitivity.pop(layer) # Surgical dispatch is always final move
+            total_units = len(best_candidate['current_bit_list'])
+            units_to_move = max(1, int(round(best_candidate['eligible_units'] * fraction)))
+            new_bit_list = _replace_bits(
+                best_candidate['current_bit_list'],
+                best_candidate['old_bits'],
+                best_candidate['w_bits'],
+                units_to_move
+            )
+            best_candidate['bit_list'] = new_bit_list
+            best_candidate['d'] = _avg_packing_from_bits(new_bit_list, sim)
+            best_candidate['granular_weights'] = _granular_dist_from_bits(new_bit_list)
+        else:
+            # Full move on all currently eligible units, still keeping the layer open for later refinement.
+            new_bit_list = _replace_bits(
+                best_candidate['current_bit_list'],
+                best_candidate['old_bits'],
+                best_candidate['w_bits'],
+                best_candidate['eligible_units']
+            )
+            best_candidate['bit_list'] = new_bit_list
+            best_candidate['d'] = _avg_packing_from_bits(new_bit_list, sim)
+            best_candidate['granular_weights'] = _granular_dist_from_bits(new_bit_list)
+            best_candidate['fraction'] = 1.0
+            if all(int(b) == int(best_candidate['w_bits']) for b in new_bit_list):
+                best_candidate['is_granular'] = False
+            else:
+                best_candidate['is_granular'] = True
         
         # Apply move
         current_drop += best_candidate['drop']
+        layer_drop_spent[layer] += best_candidate['drop']
         moves_made.append(best_candidate)
         
         config[layer]['w_bits'] = best_candidate['w_bits']
         config[layer]['a_bits'] = best_candidate['a_bits']
         config[layer]['d'] = best_candidate['d']
-        if best_candidate.get('is_granular'):
-            config[layer]['granular_dist'] = best_candidate['granular_weights']
+        config[layer]['bit_list'] = best_candidate['bit_list']
+        config[layer]['granular_dist'] = best_candidate['granular_weights']
         
         print(f"[Move {len(moves_made):2d}] {layer:15s} ({tier_map.get(layer, ''):15s}): "
               f"{best_candidate['old_bits']}b -> {best_candidate['w_bits']}b "
@@ -206,10 +288,6 @@ def hrp_greedy_search(
         
         if best_candidate.get('is_granular'):
             print(f"      [Surgical Dispatch] Split: {best_candidate['granular_weights']}")
-            if filter_counts and layer in filter_counts:
-                num = filter_counts[layer]
-                n_new = int(round(best_candidate['fraction'] * num))
-                config[layer]['bit_list'] = [best_candidate['w_bits']] * n_new + [best_candidate['old_bits']] * (num - n_new)
 
     # Final stats
     final_config = {'config': {}, 'metadata': {
