@@ -15,7 +15,7 @@ def check_model():
     import models.alexnet
     sys.modules['__main__'].fasion_mnist_alexnet = models.alexnet.AlexNet
     
-    ckpt_path = os.path.join(script_dir, 'models', 'qalex-0-7.pth')
+    ckpt_path = os.path.join(script_dir, 'models', 'qalex-8bit.pth')
     if not os.path.exists(ckpt_path):
         print(f"Error: {ckpt_path} not found")
         return
@@ -34,7 +34,7 @@ def check_model():
     # Evaluate full 10,000 samples for solid proof
     acc = evaluate_accuracy(model, dataloader, device='cpu', max_samples=10000)
     print(f"\n============================================================")
-    print(f"VERIFIED BASELINE ACCURACY: {acc:.2f}%")
+    print(f"VERIFIED 8-BIT BASELINE ACCURACY: {acc:.2f}%")
     print(f"============================================================")
     
     # Check weight types

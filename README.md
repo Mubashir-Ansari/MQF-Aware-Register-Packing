@@ -67,13 +67,13 @@ python quantization_framework/experiments/auto_quantize_engine_joint.py \
 # ResNet-18 on GTSRB
 python quantization_framework/experiments/auto_quantize_engine_joint.py \
   --model resnet \
-  --checkpoint models/road_0.9994904891304348.pth \
+  --checkpoint models/qresnet-8bit.pth \
   --dataset gtsrb --bits 2 4 8
 
 # AlexNet on FashionMNIST (HRP Granular POC)
 python quantization_framework/experiments/auto_quantize_engine_joint.py \
   --model alexnet \
-  --checkpoint models/qalex-0-7.pth \
+  --checkpoint models/qalex-8bit.pth \
   --dataset fashionmnist --bits 2 4 8 --register-size 16
 ```
 
@@ -99,6 +99,11 @@ python quantization_framework/experiments/auto_quantize_engine_joint.py \
 ### Checkpoints
 
 Place model `.pth` / `.pt` files in `models/`. The directory is gitignored.
+
+Current baseline checkpoints used in this repo:
+- `models/qalex-8bit.pth`
+- `models/qresnet-8bit.pth`
+- `models/qvgg-8bit.pth`
 
 ---
 

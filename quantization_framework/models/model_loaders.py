@@ -49,6 +49,18 @@ def print_model_size(model, checkpoint_path=None, label="Model"):
         print()
     print(f"{'='*60}")
 
+def _patch_legacy_alexnet_modules(model):
+    """Backfill modules expected by the current AlexNet forward() for old checkpoints."""
+    if not hasattr(model, 'relu_fc1'):
+        model.relu_fc1 = torch.nn.ReLU()
+    if not hasattr(model, 'dropout1'):
+        model.dropout1 = torch.nn.Dropout(0.5)
+    if not hasattr(model, 'relu_fc2'):
+        model.relu_fc2 = torch.nn.ReLU()
+    if not hasattr(model, 'dropout2'):
+        model.dropout2 = torch.nn.Dropout(0.5)
+    return model
+
 def load_model(model_name, checkpoint_path=None, num_classes=10):
     """
     Load a model by name, optionally loading weights from a checkpoint.
@@ -57,7 +69,7 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
     if model_name == 'vgg11_bn':
         from .vgg import vgg11_bn
         model = vgg11_bn(num_classes=num_classes)
-        default_ckpt = os.path.join(MODELS_DIR, 'vgg11_bn.pt')
+        default_ckpt = os.path.join(MODELS_DIR, 'qvgg-8bit.pth')
     elif model_name == 'levit':
         from .levit import levit_cifar
         model = levit_cifar(num_classes=num_classes)
@@ -70,12 +82,11 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
     elif model_name == 'resnet':
         from .resnet import ResNet18
         model = ResNet18(num_classes=num_classes)
-        # Assuming 'road' file is the ResNet checkpoint based on context
-        default_ckpt = os.path.join(MODELS_DIR, 'road_0.9994904891304348.pth')
+        default_ckpt = os.path.join(MODELS_DIR, 'qresnet-8bit.pth')
     elif model_name == 'alexnet':
         from .alexnet import alexnet
         model = alexnet(num_classes=num_classes)
-        default_ckpt = os.path.join(MODELS_DIR, 'qalex-0-7.pth')
+        default_ckpt = os.path.join(MODELS_DIR, 'qalex-8bit.pth')
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -91,7 +102,19 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
                 sys.modules['__main__'].fasion_mnist_alexnet = alex_mod.AlexNet
             
             state_dict = torch.load(ckpt_to_load, map_location='cpu', weights_only=False)
-            
+
+            # Some research checkpoints are serialized full model objects
+            # (e.g. quantized AlexNet baselines). In that case, use the
+            # checkpoint module directly instead of reconstructing and
+            # re-quantizing a fresh instance.
+            if isinstance(state_dict, torch.nn.Module):
+                print(f"Checkpoint contains full {type(state_dict)} module. Using it directly.")
+                model = state_dict
+                if model_name == 'alexnet':
+                    model = _patch_legacy_alexnet_modules(model)
+                print_model_size(model, ckpt_to_load, label=f"{model_name}")
+                return model
+             
             # Case 1: Full model or object with state_dict
             if hasattr(state_dict, 'state_dict') and not isinstance(state_dict, dict):
                 print(f"Checkpoint contains {type(state_dict)} object. Extracting state_dict.")
@@ -119,7 +142,7 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
                     name = name[6:]
                 new_state_dict[name] = v
                 
-            # Handle quanto quantized models (like AlexNet qalex-0-7.pth)
+            # Handle quanto quantized checkpoints (e.g. 8-bit AlexNet baseline)
             if model_name == 'alexnet' and HAS_QUANTO:
                 print("Applying 'quanto' quantization (Weights+Activations) to model before loading state_dict...")
                 # The checkpoint contains both weight scales and activation scales

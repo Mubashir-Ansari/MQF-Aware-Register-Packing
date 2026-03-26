@@ -19,7 +19,7 @@ def run_alexnet_hrp_poc():
     # 1. Load AlexNet
     model_name = "alexnet"
     # Using the user's provided checkpoint
-    checkpoint = "models/qalex-0-7.pth"
+    checkpoint = "models/qalex-8bit.pth"
     
     print(f"[*] Loading {model_name} with {checkpoint}...")
     try:
@@ -37,7 +37,7 @@ def run_alexnet_hrp_poc():
         print(f"[✓] Dataloader ready ({len(loader.dataset)} samples)")
         
         baseline_acc = evaluate_accuracy(model, loader, device='cpu', max_samples=500)
-        print(f"[✓] Baseline Accuracy (PTQ/INT8): {baseline_acc:.2f}%")
+        print(f"[✓] Baseline Accuracy (8-bit quantized AlexNet): {baseline_acc:.2f}%")
     except Exception as e:
         print(f"[!] Warning: Could not run real evaluation: {e}")
         baseline_acc = 0.0
