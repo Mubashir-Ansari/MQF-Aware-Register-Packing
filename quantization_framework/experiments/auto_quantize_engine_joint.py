@@ -415,6 +415,7 @@ def auto_quantize_joint(args):
           f"--target-drop {target_drop} " \
           f"--max-layer-budget-share {getattr(args, 'max_layer_budget_share', 0.35)} " \
           f"--min-layers-to-modify {getattr(args, 'min_layers_to_modify', 3)} " \
+          f"--storage-gain-weight {getattr(args, 'storage_gain_weight', 1.0)} " \
           f"--register-size {getattr(args, 'register_size', 16)} " \
           f"--device {device} " \
           f"--baseline-acc {acc_baseline}"
@@ -832,6 +833,8 @@ if __name__ == "__main__":
                         help='Max fraction of target-drop spent in one layer during search (default: 0.35)')
     parser.add_argument('--min-layers-to-modify', type=int, default=3,
                         help='Minimum desired number of modified layers in search (default: 3)')
+    parser.add_argument('--storage-gain-weight', type=float, default=1.0,
+                        help='Relative weight of storage reduction when ranking search candidates (default: 1.0)')
 
     # GTSRB-specific options
     parser.add_argument('--gtsrb-use-train-val', type=bool, default=False,
