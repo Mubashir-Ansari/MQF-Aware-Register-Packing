@@ -206,7 +206,8 @@ def train_qat(model, config, train_loader, val_loader,
             best_acc = val_acc
             best_acc = val_acc
             epochs_no_improve = 0
-            torch.save(model.state_dict(), best_model_path)
+            cpu_state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            torch.save(cpu_state_dict, best_model_path)
             print(f"  -> New best: {best_acc:.2f}%")
         else:
             epochs_no_improve += 1
@@ -218,7 +219,7 @@ def train_qat(model, config, train_loader, val_loader,
     
     # Load best model
     if os.path.exists(best_model_path):
-        model.load_state_dict(torch.load(best_model_path, map_location=device))
+        model.load_state_dict(torch.load(best_model_path, map_location='cpu'))
 
     # Timing summary
     total_training_time = time.time() - training_start
