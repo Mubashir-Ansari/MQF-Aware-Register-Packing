@@ -83,6 +83,10 @@ def load_model(model_name, checkpoint_path=None, num_classes=10):
         from .resnet import ResNet18
         model = ResNet18(num_classes=num_classes)
         default_ckpt = os.path.join(MODELS_DIR, 'qresnet-8bit.pth')
+    elif model_name == 'resnet18':
+        from .resnet import resnet18
+        model = resnet18(num_classes=num_classes)
+        default_ckpt = os.path.join(MODELS_DIR, 'resnet18.pt')
     elif model_name == 'alexnet':
         from .alexnet import alexnet
         model = alexnet(num_classes=num_classes)
