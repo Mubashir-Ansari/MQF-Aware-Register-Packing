@@ -127,6 +127,23 @@ def write_profile_metadata(profile_csv, max_samples, baseline_acc, bits):
         json.dump(payload, f, indent=2)
 
 
+def collapse_uniform_granular_config(config):
+    """Collapse list-valued configs to scalars when all entries share the same bit-width."""
+    normalized = {}
+    has_true_mixed_granular = False
+    for layer, bits in config.items():
+        if isinstance(bits, list):
+            unique_bits = sorted(set(int(b) for b in bits))
+            if len(unique_bits) == 1:
+                normalized[layer] = int(unique_bits[0])
+            else:
+                normalized[layer] = bits
+                has_true_mixed_granular = True
+        else:
+            normalized[layer] = bits
+    return normalized, has_true_mixed_granular
+
+
 def calculate_bops_joint(model, config, input_size=32):
     """
     Calculate Bit Operations (BOPs) for joint W=A mixed-precision.
@@ -635,46 +652,63 @@ def auto_quantize_joint(args):
         # ---------------------------------------------------------
         qat_start = time.time()
         print(f"\n[STEP 5] Running Quantization-Aware Training (QAT)...")
-        cmd = f"python quantization_framework/experiments/qat_training.py " \
-              f"--model {model_name} " \
-              f"--checkpoint {checkpoint_path} " \
-              f"--config {weight_config_json} " \
-              f"--activation-config {activation_config_json} " \
-              f"--dataset {dataset} " \
-              f"--epochs 15 " \
-              f"--patience 5 " \
-              f"--max-samples {args.max_samples}"
-        run_command(cmd)
+        qat_weight_config, weight_has_mixed = collapse_uniform_granular_config(weight_config)
+        qat_activation_config, act_has_mixed = collapse_uniform_granular_config(activation_config)
 
-        print("\n[SUCCESS] QAT Completed. Measuring final accuracy...")
-
-        # Load QAT checkpoint
-        qat_checkpoint = f"{model_name}_qat_best.pth"
-        if os.path.exists(qat_checkpoint):
-            print(f"[ENGINE] Loading QAT checkpoint: {qat_checkpoint}")
-            model_qat = load_model(model_name, checkpoint_path=qat_checkpoint, num_classes=num_classes)
-            model_qat = model_qat.to(device)
-
-            # Apply activation quantizers only (weights already QAT-trained)
-            model_qat, quantizers_qat = apply_mixed_precision(model_qat, weight_config,
-                                 quantize_weights=False,
-                                 quantize_activations=True,
-                                 act_bit_width=8,
-                                 activation_config=activation_config)
-
-            if quantizers_qat:
-                calibrate_activation_quantizers(model_qat, quantizers_qat, loader, device=device, num_batches=10)
-
-            final_acc = evaluate_accuracy(model_qat, loader, device=device, max_samples=args.max_samples)
-            print(f"[QAT RESULT] Final Accuracy: {final_acc:.2f}%")
-            model = model_qat
-        else:
-            print(f"[WARNING] QAT checkpoint not found. Using PTQ accuracy.")
+        if weight_has_mixed or act_has_mixed:
+            print("[WARNING] QAT skipped: generated config contains true mixed granular layers.")
+            print("          Current QAT path supports only layer-wise configs.")
             final_acc = acc_ptq
+            qat_time = 0.0
+            used_qat = False
+        else:
+            qat_weight_config_json = f"{model_name}_config_{bits_str_filename}_qat_layerwise_weight.json"
+            qat_activation_config_json = f"{model_name}_config_{bits_str_filename}_qat_layerwise_activation.json"
+            with open(qat_weight_config_json, 'w') as f:
+                json.dump(qat_weight_config, f, indent=2)
+            with open(qat_activation_config_json, 'w') as f:
+                json.dump(qat_activation_config, f, indent=2)
 
-        qat_time = time.time() - qat_start
-        print(f"[TIMING] QAT completed in {qat_time:.2f}s ({qat_time/60:.1f} min)")
-        used_qat = True
+            cmd = f"python quantization_framework/experiments/qat_training.py " \
+                  f"--model {model_name} " \
+                  f"--checkpoint {checkpoint_path} " \
+                  f"--config {qat_weight_config_json} " \
+                  f"--activation-config {qat_activation_config_json} " \
+                  f"--dataset {dataset} " \
+                  f"--epochs 15 " \
+                  f"--patience 5 " \
+                  f"--max-samples {args.max_samples}"
+            run_command(cmd)
+
+            print("\n[SUCCESS] QAT Completed. Measuring final accuracy...")
+
+            # Load QAT checkpoint
+            qat_checkpoint = f"{model_name}_qat_best.pth"
+            if os.path.exists(qat_checkpoint):
+                print(f"[ENGINE] Loading QAT checkpoint: {qat_checkpoint}")
+                model_qat = load_model(model_name, checkpoint_path=qat_checkpoint, num_classes=num_classes)
+                model_qat = model_qat.to(device)
+
+                # Apply activation quantizers only (weights already QAT-trained)
+                model_qat, quantizers_qat = apply_mixed_precision(model_qat, qat_weight_config,
+                                     quantize_weights=False,
+                                     quantize_activations=True,
+                                     act_bit_width=8,
+                                     activation_config=qat_activation_config)
+
+                if quantizers_qat:
+                    calibrate_activation_quantizers(model_qat, quantizers_qat, loader, device=device, num_batches=10)
+
+                final_acc = evaluate_accuracy(model_qat, loader, device=device, max_samples=args.max_samples)
+                print(f"[QAT RESULT] Final Accuracy: {final_acc:.2f}%")
+                model = model_qat
+            else:
+                print(f"[WARNING] QAT checkpoint not found. Using PTQ accuracy.")
+                final_acc = acc_ptq
+
+            qat_time = time.time() - qat_start
+            print(f"[TIMING] QAT completed in {qat_time:.2f}s ({qat_time/60:.1f} min)")
+            used_qat = True
 
     # ============================================================
     # STEP 6: BOPs ANALYSIS (Joint W=A)
