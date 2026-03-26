@@ -218,7 +218,7 @@ def train_qat(model, config, train_loader, val_loader,
     
     # Load best model
     if os.path.exists(best_model_path):
-        model.load_state_dict(torch.load(best_model_path))
+        model.load_state_dict(torch.load(best_model_path, map_location=device))
 
     # Timing summary
     total_training_time = time.time() - training_start
