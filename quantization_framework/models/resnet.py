@@ -117,25 +117,33 @@ class Bottleneck(nn.Module):
         self.downsample = downsample
         self.stride = stride
 
-    def forward(self, x):
+    def forward(self, x, reqap_fn=None, block_name=""):
         identity = x
 
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
+        if reqap_fn is not None:
+            out = reqap_fn(out, f"{block_name}.conv1")
 
         out = self.conv2(out)
         out = self.bn2(out)
         out = self.relu(out)
+        if reqap_fn is not None:
+            out = reqap_fn(out, f"{block_name}.conv2")
 
         out = self.conv3(out)
         out = self.bn3(out)
+        if reqap_fn is not None:
+            out = reqap_fn(out, f"{block_name}.conv3")
 
         if self.downsample is not None:
             identity = self.downsample(x)
 
         out += identity
         out = self.relu(out)
+        if reqap_fn is not None:
+            out = reqap_fn(out, f"{block_name}.after_residual")
         return out
 
 
