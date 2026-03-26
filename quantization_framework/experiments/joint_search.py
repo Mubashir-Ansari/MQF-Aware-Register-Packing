@@ -91,6 +91,10 @@ def _replace_bits(bit_list, source_bit, target_bit, num_to_move):
                 break
     return out
 
+def _estimate_layer_priority(layer, param_counts, filter_counts):
+    """Bias refinement toward layers with the largest hardware impact."""
+    return float((param_counts or {}).get(layer, 0)) + 16.0 * float((filter_counts or {}).get(layer, 0))
+
 def hrp_greedy_search(
     sensitivity,
     bit_choices,
@@ -100,7 +104,10 @@ def hrp_greedy_search(
     filter_counts=None,
     param_counts=None,
     max_layer_budget_share=0.35,
-    min_layers_to_modify=3
+    min_layers_to_modify=3,
+    refinement_passes=1,
+    refinement_layer_budget_scale=1.75,
+    min_high_impact_priority=0.0
 ):
     """
     Hybrid-Tier Surgical Search Pipeline.
@@ -144,13 +151,18 @@ def hrp_greedy_search(
     # Track cumulative estimated drop per layer to keep iterative refinement bounded.
     moves_made = []
     current_drop = 0.0
-    per_layer_drop_cap = max_layer_budget_share * target_drop
+    base_per_layer_drop_cap = max_layer_budget_share * target_drop
     layer_drop_spent = {layer: 0.0 for layer in sensitivity.keys()}
+    layer_priority = {
+        layer: _estimate_layer_priority(layer, param_counts, filter_counts)
+        for layer in sensitivity.keys()
+    }
+    if min_high_impact_priority <= 0.0:
+        min_high_impact_priority = max(layer_priority.values(), default=0.0) * 0.25
 
     print(f"\n[METRIC] Multi-Pass Search initialized...")
 
-    # MULTI-PASS GREEDY SEARCH
-    while current_drop < target_drop:
+    def collect_valid_moves(refinement_mode=False):
         valid_moves = []
         for layer, scores in list(sensitivity.items()):
             num_units = (filter_counts or {}).get(layer, 1)
@@ -213,19 +225,26 @@ def hrp_greedy_search(
                             'full_marginal_drop': full_marginal_drop,
                             'eligible_units': eligible_units,
                             'current_bit_list': bit_list,
-                            'score': score
+                            'score': score,
+                            'priority': layer_priority.get(layer, 0.0)
                         })
-        
-        if not valid_moves:
-            break
-            
-        if len(set(m['layer'] for m in moves_made)) < min_layers_to_modify:
-            unseen_layer_moves = [m for m in valid_moves if m['layer'] not in {mm['layer'] for mm in moves_made}]
-            candidate_pool = unseen_layer_moves if unseen_layer_moves else valid_moves
-        else:
-            candidate_pool = valid_moves
+        if refinement_mode:
+            high_impact_moves = [m for m in valid_moves if m['priority'] >= min_high_impact_priority]
+            if high_impact_moves:
+                return high_impact_moves
+        return valid_moves
 
-        candidate_pool.sort(key=lambda x: x['score'], reverse=True)
+    def apply_best_move(candidate_pool, per_layer_drop_cap, refinement_mode=False):
+        nonlocal current_drop
+        if not candidate_pool:
+            return False
+
+        if not refinement_mode and len(set(m['layer'] for m in moves_made)) < min_layers_to_modify:
+            seen_layers = {mm['layer'] for mm in moves_made}
+            unseen_layer_moves = [m for m in candidate_pool if m['layer'] not in seen_layers]
+            candidate_pool = unseen_layer_moves if unseen_layer_moves else candidate_pool
+
+        candidate_pool.sort(key=lambda x: (x['score'], x['priority']), reverse=True)
         best_candidate = candidate_pool[0]
         layer = best_candidate['layer']
         
@@ -234,7 +253,8 @@ def hrp_greedy_search(
         allowed_drop = min(remaining_budget, remaining_layer_cap)
         
         if best_candidate['drop'] > allowed_drop:
-            if allowed_drop <= 0: break
+            if allowed_drop <= 0:
+                return False
             
             fraction = allowed_drop / max(best_candidate['drop'], 1e-4)
             tier = tier_map.get(layer, "Tier 3")
@@ -244,12 +264,11 @@ def hrp_greedy_search(
             else: fraction = min(fraction, 0.95) 
 
             if fraction < 0.02: 
-                continue
+                return False
 
             best_candidate['is_granular'] = True
             best_candidate['fraction'] = fraction
             best_candidate['drop'] = allowed_drop
-            total_units = len(best_candidate['current_bit_list'])
             units_to_move = max(1, int(round(best_candidate['eligible_units'] * fraction)))
             new_bit_list = _replace_bits(
                 best_candidate['current_bit_list'],
@@ -294,6 +313,33 @@ def hrp_greedy_search(
         
         if best_candidate.get('is_granular'):
             print(f"      [Surgical Dispatch] Split: {best_candidate['granular_weights']}")
+
+        return True
+
+    # Initial greedy pass.
+    while current_drop < target_drop:
+        valid_moves = collect_valid_moves(refinement_mode=False)
+        if not valid_moves:
+            break
+        if not apply_best_move(valid_moves, base_per_layer_drop_cap, refinement_mode=False):
+            break
+
+    # Refinement pass: reuse remaining budget on high-impact layers with a relaxed per-layer cap.
+    for refine_idx in range(max(0, refinement_passes)):
+        if current_drop >= target_drop:
+            break
+        refined_any = False
+        relaxed_cap = base_per_layer_drop_cap * refinement_layer_budget_scale
+        print(f"[REFINE {refine_idx + 1}] Re-entering search with relaxed per-layer cap ({relaxed_cap:.2f}%).")
+        while current_drop < target_drop:
+            refinement_moves = collect_valid_moves(refinement_mode=True)
+            if not refinement_moves:
+                break
+            if not apply_best_move(refinement_moves, relaxed_cap, refinement_mode=True):
+                break
+            refined_any = True
+        if not refined_any:
+            break
 
     # Final stats
     final_config = {'config': {}, 'metadata': {
@@ -366,6 +412,9 @@ if __name__ == "__main__":
     parser.add_argument('--output', type=str, default=None)
     parser.add_argument('--max-layer-budget-share', type=float, default=0.35)
     parser.add_argument('--min-layers-to-modify', type=int, default=3)
+    parser.add_argument('--refinement-passes', type=int, default=1)
+    parser.add_argument('--refinement-layer-budget-scale', type=float, default=1.75)
+    parser.add_argument('--min-high-impact-priority', type=float, default=0.0)
     parser.add_argument('--baseline-acc', type=float, default=None)
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
@@ -385,6 +434,9 @@ if __name__ == "__main__":
         register_size=args.register_size, filter_counts=filter_counts,
         param_counts=param_counts, max_layer_budget_share=args.max_layer_budget_share,
         min_layers_to_modify=args.min_layers_to_modify,
+        refinement_passes=args.refinement_passes,
+        refinement_layer_budget_scale=args.refinement_layer_budget_scale,
+        min_high_impact_priority=args.min_high_impact_priority,
         baseline_acc=args.baseline_acc
     )
     save_config(config, args.output, stats)
