@@ -95,6 +95,12 @@ def _estimate_layer_priority(layer, param_counts, filter_counts):
     """Bias refinement toward layers with the largest hardware impact."""
     return float((param_counts or {}).get(layer, 0)) + 16.0 * float((filter_counts or {}).get(layer, 0))
 
+def _estimate_storage_words_from_bits(bit_list, params_per_unit, register_size):
+    """Approximate packed storage words for a layer from its current per-unit bit assignment."""
+    if not bit_list or register_size <= 0:
+        return 0.0
+    return sum((params_per_unit * int(b)) / float(register_size) for b in bit_list)
+
 def hrp_greedy_search(
     sensitivity,
     bit_choices,
@@ -107,7 +113,8 @@ def hrp_greedy_search(
     min_layers_to_modify=3,
     refinement_passes=1,
     refinement_layer_budget_scale=1.75,
-    min_high_impact_priority=0.0
+    min_high_impact_priority=0.0,
+    storage_gain_weight=1.0
 ):
     """
     Hybrid-Tier Surgical Search Pipeline.
@@ -168,6 +175,9 @@ def hrp_greedy_search(
             num_units = (filter_counts or {}).get(layer, 1)
             bit_list = _ensure_bit_list(config[layer], num_units)
             current_d = _avg_packing_from_bits(bit_list, sim)
+            layer_params = (param_counts or {}).get(layer, 1)
+            params_per_unit = layer_params / max(num_units, 1)
+            current_storage_words = _estimate_storage_words_from_bits(bit_list, params_per_unit, register_size)
             
             # Constraint Enforcement
             tier = tier_map.get(layer, "Tier 3")
@@ -205,15 +215,17 @@ def hrp_greedy_search(
                     new_bit_list = _replace_bits(bit_list, source_bit, bits, eligible_units)
                     new_d = _avg_packing_from_bits(new_bit_list, sim)
                     d_gain = new_d - current_d
-                    layer_params = (param_counts or {}).get(layer, 1)
                     reg_gain = layer_params * ((1.0 / max(current_d, 1e-9)) - (1.0 / max(new_d, 1e-9)))
+                    new_storage_words = _estimate_storage_words_from_bits(new_bit_list, params_per_unit, register_size)
+                    storage_gain = max(0.0, current_storage_words - new_storage_words)
 
                     unlock_bonus = 0.0
                     if d_gain <= 0 and future_gain_exists and full_marginal_drop <= 3.0:
                         unlock_bonus = 0.10 * layer_params
 
-                    if reg_gain > 0 or unlock_bonus > 0:
-                        score = (reg_gain + unlock_bonus) / (predicted_drop + 0.01)
+                    hardware_gain = reg_gain + (storage_gain_weight * storage_gain) + unlock_bonus
+                    if reg_gain > 0 or storage_gain > 0 or unlock_bonus > 0:
+                        score = hardware_gain / (predicted_drop + 0.01)
                         valid_moves.append({
                             'layer': layer,
                             'w_bits': bits,
@@ -221,6 +233,8 @@ def hrp_greedy_search(
                             'old_bits': source_bit,
                             'd': new_d,
                             'reg_gain': reg_gain,
+                            'storage_gain': storage_gain,
+                            'hardware_gain': hardware_gain,
                             'drop': predicted_drop,
                             'full_marginal_drop': full_marginal_drop,
                             'eligible_units': eligible_units,
@@ -415,6 +429,7 @@ if __name__ == "__main__":
     parser.add_argument('--refinement-passes', type=int, default=1)
     parser.add_argument('--refinement-layer-budget-scale', type=float, default=1.75)
     parser.add_argument('--min-high-impact-priority', type=float, default=0.0)
+    parser.add_argument('--storage-gain-weight', type=float, default=1.0)
     parser.add_argument('--baseline-acc', type=float, default=None)
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
@@ -437,6 +452,7 @@ if __name__ == "__main__":
         refinement_passes=args.refinement_passes,
         refinement_layer_budget_scale=args.refinement_layer_budget_scale,
         min_high_impact_priority=args.min_high_impact_priority,
+        storage_gain_weight=args.storage_gain_weight,
         baseline_acc=args.baseline_acc
     )
     save_config(config, args.output, stats)
