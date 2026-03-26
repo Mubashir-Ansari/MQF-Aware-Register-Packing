@@ -339,7 +339,7 @@ def auto_quantize_joint(args):
         input_size = 227
     elif model_name in ['levit', 'swin']:
         input_size = 224
-    elif model_name in ['vgg11_bn', 'resnet']:
+    elif model_name in ['vgg11_bn', 'resnet', 'resnet18']:
         input_size = 32
     else:
         input_size = 224
@@ -572,7 +572,7 @@ def auto_quantize_joint(args):
         input_size = 227
     elif model_name in ['levit', 'swin']:
         input_size = 224
-    elif model_name in ['vgg11_bn', 'resnet']:
+    elif model_name in ['vgg11_bn', 'resnet', 'resnet18']:
         input_size = 32
     else:  # fashionmnist, cifar10, cifar100, gtsrb
         input_size = 224
