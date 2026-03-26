@@ -344,7 +344,21 @@ def auto_quantize_joint(args):
     else:
         input_size = 224
         
-    loader = get_fashionmnist_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
+    if dataset == 'cifar100':
+        loader = get_cifar100_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
+    elif dataset == 'gtsrb':
+        loader = get_gtsrb_dataloader(
+            batch_size=eval_batch_size,
+            train=False,
+            input_size=input_size,
+            use_train_val_split=gtsrb_use_train_val,
+            val_ratio=gtsrb_val_ratio,
+            seed=gtsrb_seed
+        )
+    elif dataset == 'fashionmnist':
+        loader = get_fashionmnist_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
+    else:
+        loader = get_cifar10_dataloader(batch_size=eval_batch_size, train=False, input_size=input_size)
     # Use already imported evaluate_accuracy
     acc_baseline = evaluate_accuracy(model, loader, device=device, max_samples=args.max_samples)
     print(f"Baseline Accuracy ({model_name} on {dataset}): {acc_baseline:.2f}%")
