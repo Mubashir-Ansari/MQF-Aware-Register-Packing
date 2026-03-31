@@ -15,6 +15,14 @@ from PIL import Image
 import random
 import numpy as np
 import os
+import sys
+
+
+def _safe_num_workers(num_workers):
+    """Avoid Windows multiprocessing permission issues in research scripts."""
+    if sys.platform.startswith("win"):
+        return 0
+    return num_workers
 
 
 # ============================================================================
@@ -40,7 +48,7 @@ def get_cifar10_dataloader(train=False, batch_size=128, input_size=32, num_worke
     transform = transforms.Compose(transforms_list)
     
     dataset = datasets.CIFAR10(root=data_path, train=train, download=True, transform=transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=num_workers)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=_safe_num_workers(num_workers))
 
 
 # ============================================================================
@@ -65,7 +73,7 @@ def get_cifar100_dataloader(train=False, batch_size=128, input_size=32, num_work
     transform = transforms.Compose(transforms_list)
     
     dataset = datasets.CIFAR100(root=data_path, train=train, download=True, transform=transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=num_workers)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=_safe_num_workers(num_workers))
 
 
 # ============================================================================
@@ -90,7 +98,7 @@ def get_fashionmnist_dataloader(train=False, batch_size=128, input_size=32, num_
     transform = transforms.Compose(transforms_list)
     
     dataset = datasets.FashionMNIST(root=data_path, train=train, download=True, transform=transform)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=num_workers)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=train, num_workers=_safe_num_workers(num_workers))
 
 
 # ============================================================================
@@ -240,15 +248,15 @@ def get_gtsrb_dataloader(train=False, batch_size=128, input_size=224, num_worker
         train_subset, val_subset = GTSRBTrainValSplit.get_split(full_dataset, val_ratio, seed)
         
         if train:
-            return DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+            return DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=_safe_num_workers(num_workers))
         else:
-            return DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+            return DataLoader(val_subset, batch_size=batch_size, shuffle=False, num_workers=_safe_num_workers(num_workers))
     
     # 4. MODE 2: Standard Train/Test Split (ORIGINAL - backward compatible)
     if train:
         # Training: use full ImageFolder
         dataset = datasets.ImageFolder(train_dir, transform=transform)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=_safe_num_workers(num_workers))
     
     else:
         # Testing: use Test.csv with proper label mapping
@@ -269,7 +277,7 @@ def get_gtsrb_dataloader(train=False, batch_size=128, input_size=224, num_worker
             class_to_idx=class_to_idx,
             transform=transform
         )
-        return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=_safe_num_workers(num_workers))
 
 
 # ============================================================================

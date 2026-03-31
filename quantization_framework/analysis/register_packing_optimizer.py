@@ -9,6 +9,11 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
+try:
+    from .cgrp import cgrp_pack_layer, posthoc_pack_layer
+except ImportError:
+    from cgrp import cgrp_pack_layer, posthoc_pack_layer
+
 
 @dataclass
 class PackedField:
@@ -598,6 +603,17 @@ def _make_layer_reports(
             input_elem_hist = _scale_hist(prev_output_hist, meta.input_elements)
 
         weight_channel_hist = _channel_hist(w_cfg, meta.out_units)
+        cgrp_result = None
+        posthoc_result = None
+        if (
+            isinstance(w_cfg, list)
+            and isinstance(a_cfg, list)
+            and len(w_cfg) == len(a_cfg)
+            and len(w_cfg) > 0
+        ):
+            channels = list(zip(w_cfg, a_cfg))
+            cgrp_result = cgrp_pack_layer(channels, R=register_size)
+            posthoc_result = posthoc_pack_layer(channels, R=register_size)
 
         if strategy == "raw_homogeneous":
             w_words, w_slack, w_used = _raw_words_and_slack(weight_elem_hist, register_size, None)
@@ -729,6 +745,33 @@ def _make_layer_reports(
             strategy_notes = "Compact storage with regular compute-time repacking grouped by exact bit-width."
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
+
+        if cgrp_result is not None:
+            # OLD: packed_issues, lane_util, max_safe_tile, overflow_risk were derived from
+            # OLD: the legacy histogram/simulator path alone.
+            # OLD: w_words, w_slack, w_used were derived from width histograms alone.
+            n_regs = cgrp_result["n_regs"]
+            fill_rate = cgrp_result["fill_rate"]
+            wasted_bits = cgrp_result["wasted_bits"]
+            packed_issue_reduction = cgrp_result["packed_issue_reduction"]
+
+            posthoc_n_regs = posthoc_result["n_regs"]
+            posthoc_pir = posthoc_result["packed_issue_reduction"]
+
+            w_words = n_regs
+            w_used = sum(int(bw) for bw, _ in channels)
+            w_slack = wasted_bits
+            packed_issues = max(
+                1,
+                int(math.ceil(meta.scalar_macs / max(packed_issue_reduction, 1e-9))),
+            )
+            lane_util = fill_rate
+            max_safe_tile = max(len(bin_channels) for bin_channels in cgrp_result["bins"])
+            overflow_risk = False
+            strategy_notes += (
+                f" CGRP weight_regs={n_regs}, posthoc_weight_regs={posthoc_n_regs},"
+                f" cgrp_pir={packed_issue_reduction:.4f}, posthoc_pir={posthoc_pir:.4f}."
+            )
 
         total_regs = int(w_words + a_words + o_words)
         alloc_bits = int(total_regs * register_size)

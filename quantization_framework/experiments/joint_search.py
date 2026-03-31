@@ -17,12 +17,17 @@ import csv
 import json
 import sys
 import os
+from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from models.model_loaders import load_model
 from quantization.hardware_sim import RegisterPackingSimulator
 import models.alexnet
 sys.modules['__main__'].fasion_mnist_alexnet = models.alexnet.AlexNet
+analysis_dir = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) / "analysis"
+if str(analysis_dir) not in sys.path:
+    sys.path.append(str(analysis_dir))
+from cgrp import packing_score_delta
 
 
 def load_joint_sensitivity(profile_csv):
@@ -114,7 +119,8 @@ def hrp_greedy_search(
     refinement_passes=1,
     refinement_layer_budget_scale=1.75,
     min_high_impact_priority=0.0,
-    storage_gain_weight=1.0
+    storage_gain_weight=1.0,
+    score_gamma=0.2
 ):
     """
     Hybrid-Tier Surgical Search Pipeline.
@@ -167,6 +173,12 @@ def hrp_greedy_search(
     if min_high_impact_priority <= 0.0:
         min_high_impact_priority = max(layer_priority.values(), default=0.0) * 0.25
 
+    # Co-optimization weights
+    SCORE_ALPHA = 0.4
+    SCORE_BETA = 0.4
+    SCORE_GAMMA = score_gamma
+    SCORE_DELTA = 1.0
+
     print(f"\n[METRIC] Multi-Pass Search initialized...")
 
     def collect_valid_moves(refinement_mode=False):
@@ -218,6 +230,24 @@ def hrp_greedy_search(
                     reg_gain = layer_params * ((1.0 / max(current_d, 1e-9)) - (1.0 / max(new_d, 1e-9)))
                     new_storage_words = _estimate_storage_words_from_bits(new_bit_list, params_per_unit, register_size)
                     storage_gain = max(0.0, current_storage_words - new_storage_words)
+                    current_channels = list(zip(bit_list, bit_list))
+                    bops_reduction_term = max(0.0, d_gain)
+                    storage_reduction_term = max(0.0, storage_gain)
+                    accuracy_proxy_term = predicted_drop
+                    pack_delta = 0.0
+                    if bit_list:
+                        move_idx = next(
+                            (idx for idx, value in enumerate(bit_list) if int(value) == int(source_bit)),
+                            None
+                        )
+                        if move_idx is not None:
+                            pack_delta = packing_score_delta(
+                                channel_idx=move_idx,
+                                candidate_bw=bits,
+                                candidate_ba=bits,
+                                current_channels=current_channels,
+                                R=register_size,
+                            )
 
                     unlock_bonus = 0.0
                     if d_gain <= 0 and future_gain_exists and full_marginal_drop <= 3.0:
@@ -225,7 +255,12 @@ def hrp_greedy_search(
 
                     hardware_gain = reg_gain + (storage_gain_weight * storage_gain) + unlock_bonus
                     if reg_gain > 0 or storage_gain > 0 or unlock_bonus > 0:
-                        score = hardware_gain / (predicted_drop + 0.01)
+                        score = (
+                            SCORE_ALPHA * bops_reduction_term
+                            + SCORE_BETA * storage_reduction_term
+                            + SCORE_GAMMA * pack_delta
+                            - SCORE_DELTA * accuracy_proxy_term
+                        )
                         valid_moves.append({
                             'layer': layer,
                             'w_bits': bits,
@@ -235,6 +270,7 @@ def hrp_greedy_search(
                             'reg_gain': reg_gain,
                             'storage_gain': storage_gain,
                             'hardware_gain': hardware_gain,
+                            'pack_delta': pack_delta,
                             'drop': predicted_drop,
                             'full_marginal_drop': full_marginal_drop,
                             'eligible_units': eligible_units,
@@ -430,6 +466,7 @@ if __name__ == "__main__":
     parser.add_argument('--refinement-layer-budget-scale', type=float, default=1.75)
     parser.add_argument('--min-high-impact-priority', type=float, default=0.0)
     parser.add_argument('--storage-gain-weight', type=float, default=1.0)
+    parser.add_argument('--score-gamma', type=float, default=0.2)
     parser.add_argument('--baseline-acc', type=float, default=None)
     parser.add_argument('--device', type=str, default='cpu')
     args = parser.parse_args()
@@ -453,6 +490,7 @@ if __name__ == "__main__":
         refinement_layer_budget_scale=args.refinement_layer_budget_scale,
         min_high_impact_priority=args.min_high_impact_priority,
         storage_gain_weight=args.storage_gain_weight,
+        score_gamma=args.score_gamma,
         baseline_acc=args.baseline_acc
     )
     save_config(config, args.output, stats)
